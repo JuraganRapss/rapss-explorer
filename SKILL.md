@@ -59,7 +59,7 @@ These choices should be surfaced as the initial configuration flow for the skill
 Use Pear runtime only (never native node).
 
 ### Prerequisites (Node + Pear)
-Intercom requires **Node.js 22.x exactly** and the **Pear runtime**. If you have any other Node version, switch to 22 using a version manager.
+Intercom requires **Node.js 22.x exactly** and the **Pear runtime**. If you have any other Node version, switch to 22 using a version manager. **Do not install Pear unless `node -v` is 22.x.**
 
 macOS (Homebrew + nvm fallback):
 ```bash
@@ -75,6 +75,14 @@ nvm install 22
 nvm use 22
 node -v
 ```
+Alternative (fnm):
+```bash
+curl -fsSL https://fnm.vercel.app/install | bash
+source ~/.zshrc
+fnm install 22
+fnm use 22
+node -v
+```
 
 Linux (nvm):
 ```bash
@@ -82,6 +90,14 @@ curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bas
 source ~/.nvm/nvm.sh
 nvm install 22
 nvm use 22
+node -v
+```
+Alternative (fnm):
+```bash
+curl -fsSL https://fnm.vercel.app/install | bash
+source ~/.bashrc
+fnm install 22
+fnm use 22
 node -v
 ```
 
@@ -92,6 +108,12 @@ nvm use 22
 node -v
 ```
 If you use the Node installer instead, verify `node -v` shows **22.x**.
+Alternative (Volta):
+```powershell
+winget install Volta.Volta
+volta install node@22
+node -v
+```
 
 Install Pear runtime (all OS, **requires Node 22.x**):
 ```bash
@@ -177,6 +199,11 @@ Sidechannels:
 - `--sidechannel-pow-difficulty <bits>` : required leading‑zero bits (**default: 12**).
 - `--sidechannel-pow-entry 0|1` : restrict PoW to entry channel (`0000intercom`) only.
 - `--sidechannel-pow-channels "chan1,chan2"` : require PoW only on these channels (overrides entry toggle).
+- `--sidechannel-invite-required 0|1` : require signed invites (capabilities) for protected channels.
+- `--sidechannel-invite-channels "chan1,chan2"` : require invites only on these channels (otherwise all).
+- `--sidechannel-inviter-keys "<pubkey1,pubkey2>"` : trusted inviter **peer pubkeys** (hex). Needed so joiners accept admin messages.
+- `--sidechannel-invite-ttl <sec>` : default TTL for invites created via `/sc_invite` (default: 604800 = 7 days).
+  - **Invite identity:** invites are signed/verified against the **peer P2P pubkey (hex)**. The invite payload may also include the inviter’s **trac address** for payment/settlement, but validation uses the peer key.
 
 SC-Bridge (WebSocket):
 - `--sc-bridge 1` : enable WebSocket bridge for sidechannels.
@@ -235,6 +262,7 @@ Intercom must expose and describe all interactive commands so agents can operate
 - `/sc_join --channel "<name>"` : Join or create a sidechannel.
 - `/sc_open --channel "<name>" [--via "<channel>"]` : Request channel creation via the entry channel.
 - `/sc_send --channel "<name>" --message "<text>"` : Send a sidechannel message.
+- `/sc_invite --channel "<name>" --pubkey "<peer-pubkey-hex>" [--ttl <sec>]` : Create a signed invite (prints JSON + base64).
 - `/sc_stats` : Show sidechannel channel list and connection count.
 
 ## Sidechannels: Behavior and Reliability
@@ -244,6 +272,7 @@ Intercom must expose and describe all interactive commands so agents can operate
 - **Message size guard** defaults to 1,000,000 bytes (JSON‑encoded payload).
 - **Diagnostics:** use `--sidechannel-debug 1` and `/sc_stats` to confirm connection counts and message flow.
 - **Dynamic channel requests**: `/sc_open` posts a request in the entry channel; you can auto‑join with `--sidechannel-auto-join 1`.
+- **Invites**: uses the **peer pubkey** (transport identity). Invites may also include the inviter’s **trac address** for payments, but verification is by peer pubkey.
 
 ## SC‑Bridge (WebSocket) Protocol
 SC‑Bridge exposes sidechannel messages over WebSocket and accepts inbound commands.

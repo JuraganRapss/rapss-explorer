@@ -101,6 +101,39 @@ const sidechannelPowChannels = sidechannelPowChannelsRaw
       .map((value) => value.trim())
       .filter((value) => value.length > 0)
   : null;
+const sidechannelInviteRequiredRaw =
+  (flags['sidechannel-invite-required'] && String(flags['sidechannel-invite-required'])) ||
+  env.SIDECHANNEL_INVITE_REQUIRED ||
+  '';
+const sidechannelInviteRequired = parseBool(sidechannelInviteRequiredRaw, false);
+const sidechannelInviteChannelsRaw =
+  (flags['sidechannel-invite-channels'] && String(flags['sidechannel-invite-channels'])) ||
+  env.SIDECHANNEL_INVITE_CHANNELS ||
+  '';
+const sidechannelInviteChannels = sidechannelInviteChannelsRaw
+  ? sidechannelInviteChannelsRaw
+      .split(',')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0)
+  : null;
+const sidechannelInviterKeysRaw =
+  (flags['sidechannel-inviter-keys'] && String(flags['sidechannel-inviter-keys'])) ||
+  env.SIDECHANNEL_INVITER_KEYS ||
+  '';
+const sidechannelInviterKeys = sidechannelInviterKeysRaw
+  ? sidechannelInviterKeysRaw
+      .split(',')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0)
+  : [];
+const sidechannelInviteTtlRaw =
+  (flags['sidechannel-invite-ttl'] && String(flags['sidechannel-invite-ttl'])) ||
+  env.SIDECHANNEL_INVITE_TTL ||
+  '604800';
+const sidechannelInviteTtlSec = Number.parseInt(sidechannelInviteTtlRaw, 10);
+const sidechannelInviteTtlMs = Number.isFinite(sidechannelInviteTtlSec)
+  ? Math.max(sidechannelInviteTtlSec, 0) * 1000
+  : 0;
 
 const sidechannelEntry = '0000intercom';
 const sidechannelExtras = sidechannelsRaw
@@ -301,6 +334,10 @@ const sidechannel = new Sidechannel(peer, {
   powDifficulty: Number.isInteger(sidechannelPowDifficulty) ? sidechannelPowDifficulty : undefined,
   powRequireEntry: sidechannelPowRequireEntry,
   powRequiredChannels: sidechannelPowChannels || undefined,
+  inviteRequired: sidechannelInviteRequired,
+  inviteRequiredChannels: sidechannelInviteChannels || undefined,
+  inviterKeys: sidechannelInviterKeys,
+  inviteTtlMs: sidechannelInviteTtlMs,
   onMessage: scBridgeEnabled
     ? (channel, payload, connection) => scBridge.handleSidechannelMessage(channel, payload, connection)
     : null,

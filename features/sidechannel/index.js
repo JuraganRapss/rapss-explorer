@@ -2,6 +2,7 @@ import Feature from 'trac-peer/src/artifacts/feature.js';
 import b4a from 'b4a';
 import c from '../../node_modules/compact-encoding/index.js';
 import crypto from 'crypto';
+import PeerWallet from 'trac-wallet';
 
 const toTopic = (name) => b4a.alloc(32).fill(name);
 const toProtocol = (name) => `sidechannel/${name}`;
@@ -17,6 +18,13 @@ const stableStringify = (value) => {
 };
 
 const sha256Hex = (input) => crypto.createHash('sha256').update(input).digest('hex');
+
+const normalizeKeyHex = (value) => {
+  if (!value) return null;
+  if (b4a.isBuffer(value)) return b4a.toString(value, 'hex');
+  if (typeof value === 'string') return value.trim().toLowerCase();
+  return String(value).trim().toLowerCase();
+};
 
 const countLeadingZeroBits = (hex) => {
   let bits = 0;
@@ -71,6 +79,22 @@ class Sidechannel extends Feature {
     this.powRequiredChannels = Array.isArray(config.powRequiredChannels)
       ? new Set(config.powRequiredChannels.map((c) => String(c)))
       : null;
+    this.inviteRequired = config.inviteRequired === true;
+    this.inviteRequiredChannels = Array.isArray(config.inviteRequiredChannels)
+      ? new Set(config.inviteRequiredChannels.map((c) => String(c)))
+      : null;
+    const inviterKeys = Array.isArray(config.inviterKeys)
+      ? config.inviterKeys
+          .map((value) => normalizeKeyHex(value))
+          .filter((value) => value && value.length > 0)
+      : [];
+    if (this.inviteRequired && inviterKeys.length === 0) {
+      const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
+      if (selfKey) inviterKeys.push(selfKey);
+    }
+    this.inviterKeys = inviterKeys.length > 0 ? new Set(inviterKeys) : null;
+    this.inviteTtlMs = Number.isSafeInteger(config.inviteTtlMs) ? config.inviteTtlMs : 0;
+    this.invitedPeers = new Map();
 
     const initial = Array.isArray(config.channels) ? config.channels : [];
     for (const name of initial) this._registerChannel(name);
@@ -81,7 +105,7 @@ class Sidechannel extends Feature {
   }
 
   _getRemoteKey(connection) {
-    return connection?.remotePublicKey ? b4a.toString(connection.remotePublicKey, 'hex') : 'unknown';
+    return normalizeKeyHex(connection?.remotePublicKey) || 'unknown';
   }
 
   _purgeSeen(now) {
@@ -158,7 +182,7 @@ class Sidechannel extends Feature {
     return true;
   }
 
-  _buildPayload(channel, message) {
+  _buildPayload(channel, message, invite = null) {
     const ts = this._now();
     const from = this.peer?.wallet?.publicKey ?? null;
     const id = `${from ?? 'anon'}:${ts}:${Math.random().toString(36).slice(2, 10)}`;
@@ -172,18 +196,20 @@ class Sidechannel extends Feature {
       ts,
       ttl: this.relayTtl,
     };
+    if (invite) payload.invite = invite;
     this._attachPow(payload);
     return payload;
   }
 
-  requestOpen(newChannel, viaChannel = null) {
+  requestOpen(newChannel, viaChannel = null, invite = null) {
     const target = String(newChannel || '').trim();
     if (!target) return false;
     const via = String(viaChannel || this.entryChannel || '').trim();
     if (!via) return false;
     return this.broadcast(via, {
       control: 'open_channel',
-      channel: target
+      channel: target,
+      invite: invite || undefined
     });
   }
 
@@ -210,6 +236,88 @@ class Sidechannel extends Feature {
     if (this.powRequiredChannels) return this.powRequiredChannels.has(channel);
     if (this.powRequireEntry) return channel === this.entryChannel;
     return true;
+  }
+
+  _inviteRequired(channel) {
+    if (!this.inviteRequired) return false;
+    if (this.inviteRequiredChannels) return this.inviteRequiredChannels.has(channel);
+    return true;
+  }
+
+  _getInviteMap(channel) {
+    if (!this.invitedPeers.has(channel)) this.invitedPeers.set(channel, new Map());
+    return this.invitedPeers.get(channel);
+  }
+
+  _isInvited(channel, pubkey) {
+    const map = this.invitedPeers.get(channel);
+    if (!map) return false;
+    const expiresAt = map.get(pubkey);
+    if (!Number.isFinite(expiresAt)) {
+      map.delete(pubkey);
+      return false;
+    }
+    if (expiresAt <= this._now()) {
+      map.delete(pubkey);
+      return false;
+    }
+    return true;
+  }
+
+  _rememberInvite(channel, pubkey, expiresAt) {
+    if (!Number.isFinite(expiresAt)) return;
+    const map = this._getInviteMap(channel);
+    map.set(pubkey, expiresAt);
+  }
+
+  _normalizeInvitePayload(payload) {
+    return {
+      channel: String(payload?.channel ?? ''),
+      inviteePubKey: normalizeKeyHex(payload?.inviteePubKey) || '',
+      inviterPubKey: normalizeKeyHex(payload?.inviterPubKey) || '',
+      inviterAddress: payload?.inviterAddress ?? null,
+      issuedAt: Number(payload?.issuedAt),
+      expiresAt: Number(payload?.expiresAt),
+      nonce: String(payload?.nonce ?? ''),
+      version: Number.isFinite(payload?.version) ? Number(payload.version) : 1,
+    };
+  }
+
+  _verifyInvite(invite, channel, connection) {
+    if (!invite || typeof invite !== 'object') return false;
+    const payload = invite.payload && typeof invite.payload === 'object' ? invite.payload : invite;
+    const sigHex = invite.sig || invite.signature;
+    if (typeof sigHex !== 'string' || sigHex.length === 0) return false;
+    const normalized = this._normalizeInvitePayload(payload);
+    if (normalized.channel !== String(channel)) return false;
+    const remoteKey = this._getRemoteKey(connection);
+    if (normalized.inviteePubKey !== remoteKey) return false;
+    if (!normalized.inviterPubKey || normalized.inviterPubKey.length === 0) return false;
+    if (this.inviterKeys && !this.inviterKeys.has(normalized.inviterPubKey)) return false;
+    if (!Number.isFinite(normalized.issuedAt) || !Number.isFinite(normalized.expiresAt)) return false;
+    if (normalized.expiresAt <= this._now()) return false;
+    const message = stableStringify(normalized);
+    let sigBuf = null;
+    let pubBuf = null;
+    try {
+      sigBuf = b4a.from(sigHex, 'hex');
+      pubBuf = b4a.from(normalized.inviterPubKey, 'hex');
+    } catch (_e) {
+      return false;
+    }
+    if (!PeerWallet.verify(sigBuf, b4a.from(message), pubBuf)) return false;
+    this._rememberInvite(channel, remoteKey, normalized.expiresAt);
+    return true;
+  }
+
+  _checkInvite(payload, channel, connection) {
+    if (!this._inviteRequired(channel)) return true;
+    const remoteKey = this._getRemoteKey(connection);
+    if (this.inviterKeys && this.inviterKeys.has(remoteKey)) return true;
+    if (this._isInvited(channel, remoteKey)) return true;
+    const invite = payload?.invite || payload?.message?.invite;
+    if (invite && this._verifyInvite(invite, channel, connection)) return true;
+    return false;
   }
 
   _powBase(payload, nonce) {
@@ -326,6 +434,12 @@ class Sidechannel extends Feature {
             `[sidechannel:${entry.name}] recv ${payloadBytes} bytes from ${this._getRemoteKey(connection)}`
           );
         }
+        if (!this._checkInvite(payload, entry.name, connection)) {
+          if (this.debug) {
+            console.log(`[sidechannel:${entry.name}] drop (invite) from ${this._getRemoteKey(connection)}`);
+          }
+          return;
+        }
         if (!this._checkPow(payload, entry.name)) {
           if (this.debug) {
             console.log(`[sidechannel:${entry.name}] drop (invalid pow) from ${this._getRemoteKey(connection)}`);
@@ -352,6 +466,15 @@ class Sidechannel extends Feature {
         if (control === 'open_channel' && this.allowRemoteOpen && typeof requestedChannel === 'string') {
           const target = requestedChannel.trim();
           if (target.length > 0) {
+            if (this._inviteRequired(target)) {
+              const invite = payload?.message?.invite;
+              if (!invite || !this._verifyInvite(invite, target, connection)) {
+                if (this.debug) {
+                  console.log(`[sidechannel] open denied (invite) for ${target} from ${this._getRemoteKey(connection)}`);
+                }
+                return;
+              }
+            }
             if (this.autoJoinOnOpen) {
               this.addChannel(target).catch(() => {});
               console.log(`[sidechannel] auto-joined channel: ${target}`);
@@ -407,7 +530,7 @@ class Sidechannel extends Feature {
     return true;
   }
 
-  broadcast(name, message) {
+  broadcast(name, message, options = {}) {
     const channel = String(name || '').trim();
     if (!channel) return false;
     const entry = this._registerChannel(channel);
@@ -417,7 +540,7 @@ class Sidechannel extends Feature {
         this._openChannelForConnection(connection, entry);
       }
     }
-    const payload = this._buildPayload(channel, message);
+    const payload = this._buildPayload(channel, message, options.invite);
     let payloadJson = null;
     try {
       payloadJson = JSON.stringify(payload);

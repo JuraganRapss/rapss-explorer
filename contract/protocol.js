@@ -1,5 +1,47 @@
 import {Protocol} from "trac-peer";
 import { bufferToBigInt, bigIntToDecimalString } from "trac-msb/src/utils/amountSerialization.js";
+import b4a from "b4a";
+import PeerWallet from "trac-wallet";
+
+const stableStringify = (value) => {
+    if (value === null || value === undefined) return 'null';
+    if (typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) {
+        return `[${value.map(stableStringify).join(',')}]`;
+    }
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+};
+
+const normalizeInvitePayload = (payload) => {
+    return {
+        channel: String(payload?.channel ?? ''),
+        inviteePubKey: String(payload?.inviteePubKey ?? '').trim().toLowerCase(),
+        inviterPubKey: String(payload?.inviterPubKey ?? '').trim().toLowerCase(),
+        inviterAddress: payload?.inviterAddress ?? null,
+        issuedAt: Number(payload?.issuedAt),
+        expiresAt: Number(payload?.expiresAt),
+        nonce: String(payload?.nonce ?? ''),
+        version: Number.isFinite(payload?.version) ? Number(payload.version) : 1,
+    };
+};
+
+const parseInviteArg = (raw) => {
+    if (!raw) return null;
+    let text = String(raw || '').trim();
+    if (!text) return null;
+    if (text.startsWith('b64:')) text = text.slice(4);
+    if (text.startsWith('{')) {
+        try {
+            return JSON.parse(text);
+        } catch (_e) {}
+    }
+    try {
+        const decoded = b4a.toString(b4a.from(text, 'base64'));
+        return JSON.parse(decoded);
+    } catch (_e) {}
+    return null;
+};
 
 class SampleProtocol extends Protocol{
 
@@ -135,8 +177,9 @@ class SampleProtocol extends Protocol{
         console.log('- /tx --command "read_chat_last" | prints last chat message captured by contract.');
         console.log('- /tx --command "read_timer" | prints current timer feature value.');
         console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel (no autobase).');
-        console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');
-        console.log('- /sc_send --channel "<name>" --message "<text>" | send message over sidechannel.');
+        console.log('- /sc_open --channel "<name>" [--via "<channel>"] [--invite <json|b64>] | request others to open a sidechannel.');
+        console.log('- /sc_send --channel "<name>" --message "<text>" [--invite <json|b64>] | send message over sidechannel.');
+        console.log('- /sc_invite --channel "<name>" --pubkey "<peer-pubkey-hex>" [--ttl <sec>] | create a signed invite.');
         console.log('- /sc_stats | show sidechannel channels + connection count.');
         // further protocol specific options go here
     }
@@ -206,37 +249,150 @@ class SampleProtocol extends Protocol{
             const args = this.parseArgs(input);
             const name = args.channel || args.ch || args.name;
             const message = args.message || args.msg;
+            const inviteArg = args.invite || args.invite_b64 || args.invitebase64;
             if (!name || message === undefined) {
-                console.log('Usage: /sc_send --channel "<name>" --message "<text>"');
+                console.log('Usage: /sc_send --channel "<name>" --message "<text>" [--invite <json|b64>]');
                 return;
             }
             if (!this.peer.sidechannel) {
                 console.log('Sidechannel not initialized.');
                 return;
             }
+            let invite = null;
+            if (inviteArg) {
+                invite = parseInviteArg(inviteArg);
+                if (!invite) {
+                    console.log('Invalid invite. Pass JSON or base64.');
+                    return;
+                }
+            }
             await this.peer.sidechannel.addChannel(String(name));
-            this.peer.sidechannel.broadcast(String(name), message);
+            this.peer.sidechannel.broadcast(String(name), message, invite ? { invite } : undefined);
             return;
         }
         if (this.input.startsWith("/sc_open")) {
             const args = this.parseArgs(input);
             const name = args.channel || args.ch || args.name;
             const via = args.via || args.channel_via;
+            const inviteArg = args.invite || args.invite_b64 || args.invitebase64;
             if (!name) {
-                console.log('Usage: /sc_open --channel "<name>" [--via "<channel>"]');
+                console.log('Usage: /sc_open --channel "<name>" [--via "<channel>"] [--invite <json|b64>]');
                 return;
             }
             if (!this.peer.sidechannel) {
                 console.log('Sidechannel not initialized.');
                 return;
             }
+            let invite = null;
+            if (inviteArg) {
+                invite = parseInviteArg(inviteArg);
+                if (!invite) {
+                    console.log('Invalid invite. Pass JSON or base64.');
+                    return;
+                }
+            }
             const viaChannel = via || this.peer.sidechannel.entryChannel || null;
             if (!viaChannel) {
                 console.log('No entry channel configured. Pass --via "<channel>".');
                 return;
             }
-            this.peer.sidechannel.requestOpen(String(name), String(viaChannel));
+            this.peer.sidechannel.requestOpen(String(name), String(viaChannel), invite);
             console.log('Requested channel:', name);
+            return;
+        }
+        if (this.input.startsWith("/sc_invite")) {
+            const args = this.parseArgs(input);
+            const channel = args.channel || args.ch || args.name;
+            const invitee = args.pubkey || args.invitee || args.peer || args.key;
+            const ttlRaw = args.ttl || args.ttl_sec || args.ttl_s;
+            if (!channel || !invitee) {
+                console.log('Usage: /sc_invite --channel "<name>" --pubkey "<peer-pubkey-hex>" [--ttl <sec>]');
+                return;
+            }
+            if (!this.peer.sidechannel) {
+                console.log('Sidechannel not initialized.');
+                return;
+            }
+            if (this.peer?.wallet?.ready) {
+                try {
+                    await this.peer.wallet.ready;
+                } catch (_e) {}
+            }
+            const walletPub = this.peer?.wallet?.publicKey;
+            const inviterPubKey = walletPub
+                ? typeof walletPub === 'string'
+                    ? walletPub.trim().toLowerCase()
+                    : b4a.toString(walletPub, 'hex')
+                : null;
+            if (!inviterPubKey) {
+                console.log('Wallet not ready; cannot sign invite.');
+                return;
+            }
+            let inviterAddress = null;
+            try {
+                if (this.peer?.msbClient) {
+                    inviterAddress = this.peer.msbClient.pubKeyHexToAddress(inviterPubKey);
+                }
+            } catch (_e) {}
+            const issuedAt = Date.now();
+            let ttlMs = null;
+            if (ttlRaw !== undefined) {
+                const ttlSec = Number.parseInt(String(ttlRaw), 10);
+                ttlMs = Number.isFinite(ttlSec) ? Math.max(ttlSec, 0) * 1000 : null;
+            } else if (Number.isFinite(this.peer.sidechannel.inviteTtlMs) && this.peer.sidechannel.inviteTtlMs > 0) {
+                ttlMs = this.peer.sidechannel.inviteTtlMs;
+            } else {
+                ttlMs = 0;
+            }
+            if (!ttlMs || ttlMs <= 0) {
+                console.log('Invite TTL is required. Pass --ttl <sec> or set --sidechannel-invite-ttl.');
+                return;
+            }
+            const expiresAt = issuedAt + ttlMs;
+            const payload = normalizeInvitePayload({
+                channel: String(channel),
+                inviteePubKey: String(invitee).trim().toLowerCase(),
+                inviterPubKey,
+                inviterAddress,
+                issuedAt,
+                expiresAt,
+                nonce: Math.random().toString(36).slice(2, 10),
+                version: 1,
+            });
+            const message = stableStringify(payload);
+            const msgBuf = b4a.from(message);
+            let sig = this.peer.wallet.sign(msgBuf);
+            let sigHex = '';
+            if (typeof sig === 'string') {
+                sigHex = sig;
+            } else if (sig && sig.length > 0) {
+                sigHex = b4a.toString(sig, 'hex');
+            }
+            if (!sigHex) {
+                const walletSecret = this.peer?.wallet?.secretKey;
+                const secretBuf = walletSecret
+                    ? b4a.isBuffer(walletSecret)
+                        ? walletSecret
+                        : typeof walletSecret === 'string'
+                            ? b4a.from(walletSecret, 'hex')
+                            : b4a.from(walletSecret)
+                    : null;
+                if (secretBuf) {
+                    const sigBuf = PeerWallet.sign(msgBuf, secretBuf);
+                    if (sigBuf && sigBuf.length > 0) {
+                        sigHex = b4a.toString(sigBuf, 'hex');
+                    }
+                }
+            }
+            const invite = { payload, sig: sigHex };
+            const inviteJson = JSON.stringify(invite);
+            const inviteB64 = b4a.toString(b4a.from(inviteJson), 'base64');
+            if (!sigHex) {
+                console.log('Failed to sign invite; wallet secret key unavailable.');
+                return;
+            }
+            console.log(inviteJson);
+            console.log('invite_b64:', inviteB64);
             return;
         }
         if (this.input.startsWith("/sc_stats")) {
