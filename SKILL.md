@@ -273,6 +273,11 @@ Sidechannels:
 - **Owner‑only channels:** same as public, plus **only the owner pubkey can send**.
 - **Invite‑only channels:** **invite required + welcome required**, and **payloads are only sent to authorized peers** (confidential even if an uninvited/malicious peer connects to the topic).
 
+**Important security note (relay + confidentiality):**
+- Invite-only means **uninvited peers cannot read payloads**, even if they connect to the swarm topic.
+- **Relays can read what they relay** if they are invited/authorized, because they must receive the plaintext payload to forward it.
+- If you need "relays cannot read", that requires **message-level encryption** (ciphertext relay) which is **not implemented** here.
+
 SC-Bridge (WebSocket):
 - `--sc-bridge 1` : enable WebSocket bridge for sidechannels.
 - `--sc-bridge-host <host>` : bind host (default `127.0.0.1`).
@@ -487,6 +492,13 @@ It is the **primary way for agents to read and place sidechannel messages**. Hum
 - **Auth is required**. Start with `--sc-bridge-token <token>` and send `{ "type":"auth", "token":"..." }` first.
 - **CLI mirroring is disabled by default**. Enable with `--sc-bridge-cli 1`.
 - Without auth, **all commands are rejected** and no sidechannel events are delivered.
+
+**SC-Bridge security model (read this):**
+- Treat `--sc-bridge-token` like an **admin password**. Anyone who has it can send messages as this peer and can read whatever your bridge emits.
+- Bind to `127.0.0.1` (default). Do not expose the bridge port to untrusted networks.
+- `--sc-bridge-cli 1` is effectively **remote terminal control** (mirrors `/...` commands, including protocol custom commands).
+  - Do not enable it unless you explicitly need it.
+  - Never forward untrusted text into `{ "type":"cli", ... }` (prompt/tool injection risk).
 **Auth flow (important):**
 1) Connect → wait for the `hello` event.  
 2) Send `{"type":"auth","token":"<token>"}` as the **first message**.  
@@ -558,6 +570,14 @@ If a token is set, authenticate first:
 { "type": "auth", "token": "YOUR_TOKEN" }
 ```
 All WebSocket commands require auth (no exceptions).
+
+### Operational Hardening (Invite-Only + Relays)
+If you need invite-only channels to remain reachable even when `maxPeers` limits or NAT behavior prevents a full mesh, use **quiet relay peers**:
+- Invite **2+** additional peers whose only job is to stay online and relay messages (robustness).
+- Start relay peers with:
+  - `--sidechannel-quiet 1` (do not print or react to messages)
+  - do **not** enable `--sc-bridge` on relays unless you have a reason
+- Note: a relay that is invited/authorized can still read payloads (see security note above). Quiet mode reduces accidental leakage (logs/UI), not cryptographic visibility.
 
 ### Full CLI Mirroring (Dynamic)
 SC‑Bridge can execute **every TTY command** via:
