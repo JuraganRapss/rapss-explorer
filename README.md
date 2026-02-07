@@ -352,6 +352,7 @@ Prefer `rfqbotmgr` for tool-call operation: stop/restart individual bot instance
 | `--solana-keypair <path>` | Taker Solana keypair (required when `--run-swap 1`) |
 | `--solana-mint <pubkey>` | SPL mint for escrow (required when `--run-swap 1`) |
 | `--solana-decimals <n>` | Mint decimals (default `6`) |
+| `--solana-program-id <pubkey>` | Override program id (defaults to the compiled-in shared program id) |
 | `--solana-cu-limit <units>` | Optional compute unit limit |
 | `--solana-cu-price <microLamports>` | Optional priority fee |
 

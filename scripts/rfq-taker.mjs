@@ -24,7 +24,7 @@ import { verifySwapPrePayOnchain } from '../src/swap/verify.js';
 import { normalizeClnNetwork } from '../src/ln/cln.js';
 import { normalizeLndNetwork } from '../src/ln/lnd.js';
 import { lnPay } from '../src/ln/client.js';
-import { claimEscrowTx } from '../src/solana/lnUsdtEscrowClient.js';
+import { claimEscrowTx, LN_USDT_ESCROW_PROGRAM_ID } from '../src/solana/lnUsdtEscrowClient.js';
 import { readSolanaKeypair } from '../src/solana/keypair.js';
 import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
@@ -199,6 +199,7 @@ async function main() {
   const solKeypairPath = flags.get('solana-keypair') ? String(flags.get('solana-keypair')).trim() : '';
   const solMintStr = flags.get('solana-mint') ? String(flags.get('solana-mint')).trim() : '';
   const solDecimals = parseIntFlag(flags.get('solana-decimals'), 'solana-decimals', 6);
+  const solProgramIdStr = flags.get('solana-program-id') ? String(flags.get('solana-program-id')).trim() : '';
   const solComputeUnitLimit = parseIntFlag(flags.get('solana-cu-limit'), 'solana-cu-limit', null);
   const solComputeUnitPriceMicroLamports = parseIntFlag(flags.get('solana-cu-price'), 'solana-cu-price', null);
 
@@ -289,9 +290,11 @@ async function main() {
     ? (() => {
         const payer = readSolanaKeypair(solKeypairPath);
         const pool = new SolanaRpcPool({ rpcUrls: solRpcUrl, commitment: 'confirmed' });
+        const expectedProgramId = solProgramIdStr ? new PublicKey(solProgramIdStr) : LN_USDT_ESCROW_PROGRAM_ID;
         return {
           payer,
           pool,
+          expectedProgramId,
           computeUnitLimit: solComputeUnitLimit,
           computeUnitPriceMicroLamports: solComputeUnitPriceMicroLamports,
         };
@@ -492,6 +495,21 @@ async function main() {
       label: 'TERMS',
     });
 
+    // Guardrail: bind swap counterparty identity to the quote we accepted.
+    const quoteMaker = String(chosen?.quote?.signer || '').trim().toLowerCase();
+    const gotTermsSigner = String(termsMsg.signer || '').trim().toLowerCase();
+    if (quoteMaker && gotTermsSigner && quoteMaker !== gotTermsSigner) {
+      throw new Error(`terms signer mismatch vs quote signer (terms=${gotTermsSigner} quote=${quoteMaker})`);
+    }
+    const termsReceiver = String(termsMsg.body?.ln_receiver_peer || '').trim().toLowerCase();
+    if (quoteMaker && termsReceiver && quoteMaker !== termsReceiver) {
+      throw new Error(`terms.ln_receiver_peer mismatch vs quote signer (terms=${termsReceiver} quote=${quoteMaker})`);
+    }
+    const termsPayer = String(termsMsg.body?.ln_payer_peer || '').trim().toLowerCase();
+    if (termsPayer && termsPayer !== takerPubkey) {
+      throw new Error(`terms.ln_payer_peer mismatch vs our pubkey (terms=${termsPayer} want=${takerPubkey})`);
+    }
+
     // Verify Solana recipient matches our keypair before proceeding.
     const wantRecipient = sol.payer.publicKey.toBase58();
     const gotRecipient = String(termsMsg.body?.sol_recipient || '');
@@ -611,6 +629,14 @@ async function main() {
       );
     }
     if (swapCtx.trade.escrow) {
+      if (sol?.expectedProgramId) {
+        const gotProgram = String(swapCtx.trade.escrow.program_id || '').trim();
+        const wantProgram = sol.expectedProgramId.toBase58();
+        if (!gotProgram) throw new Error('escrow.program_id missing');
+        if (gotProgram !== wantProgram) {
+          throw new Error(`escrow.program_id mismatch (got=${gotProgram} want=${wantProgram})`);
+        }
+      }
       persistTrade(
         {
           sol_program_id: swapCtx.trade.escrow.program_id,
@@ -640,6 +666,31 @@ async function main() {
       { label: 'taker:verify-prepay' }
     );
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
+    // Defense-in-depth: ensure the on-chain escrow fee receiver settings match the negotiated TERMS, otherwise
+    // claim could fail (wrong trade fee vault PDA) or fees could be misrepresented.
+    if (prepay?.onchain?.state?.v === 3) {
+      const st = prepay.onchain.state;
+      const wantTradeFeeCollector = String(swapCtx.trade.terms?.trade_fee_collector || '').trim();
+      if (wantTradeFeeCollector && st.tradeFeeCollector?.toBase58?.() !== wantTradeFeeCollector) {
+        throw new Error(
+          `onchain tradeFeeCollector mismatch vs terms (state=${st.tradeFeeCollector.toBase58()} terms=${wantTradeFeeCollector})`
+        );
+      }
+      const wantTradeFeeBps = Number(swapCtx.trade.terms?.trade_fee_bps || 0);
+      if (Number.isFinite(wantTradeFeeBps) && Number(st.tradeFeeBps) !== wantTradeFeeBps) {
+        throw new Error(`onchain tradeFeeBps mismatch vs terms (state=${st.tradeFeeBps} terms=${wantTradeFeeBps})`);
+      }
+      const wantPlatformFeeCollector = String(swapCtx.trade.terms?.platform_fee_collector || '').trim();
+      if (wantPlatformFeeCollector && st.platformFeeCollector?.toBase58?.() !== wantPlatformFeeCollector) {
+        throw new Error(
+          `onchain platformFeeCollector mismatch vs terms (state=${st.platformFeeCollector.toBase58()} terms=${wantPlatformFeeCollector})`
+        );
+      }
+      const wantPlatformFeeBps = Number(swapCtx.trade.terms?.platform_fee_bps || 0);
+      if (Number.isFinite(wantPlatformFeeBps) && Number(st.platformFeeBps) !== wantPlatformFeeBps) {
+        throw new Error(`onchain platformFeeBps mismatch vs terms (state=${st.platformFeeBps} terms=${wantPlatformFeeBps})`);
+      }
+    }
 
     if (priceGuard) {
       const px = await fetchBtcUsdtMedian();
@@ -866,6 +917,13 @@ async function main() {
         if (!chosen) return;
         if (String(msg.body?.rfq_id || '').trim().toLowerCase() !== chosen.rfq_id) return;
         if (String(msg.body?.quote_id || '').trim().toLowerCase() !== chosen.quote_id) return;
+
+        // Guardrail: only accept swap invites from the same maker that authored the quote we accepted.
+        const quoteMaker = String(chosen?.quote?.signer || '').trim().toLowerCase();
+        const ownerPubkey = String(msg.body?.owner_pubkey || '').trim().toLowerCase();
+        const inviterPubkey = String(msg.body?.invite?.payload?.inviterPubKey || '').trim().toLowerCase();
+        const inviteMaker = ownerPubkey || inviterPubkey;
+        if (quoteMaker && inviteMaker && inviteMaker !== quoteMaker) return;
 
         const swapChannel = String(msg.body?.swap_channel || '').trim();
         if (!swapChannel) return;
