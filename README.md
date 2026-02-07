@@ -67,6 +67,11 @@ Install this repo using SKILL.md. Run unit + local e2e. Then run a smoke test on
 Pull the latest version of this fork, resolve merge conflicts, and run all tests (unit + e2e). If testnet smoke tests exist, run them too. Only then proceed to mainnet checks.
 ```
 
+4. Mainnet start
+```text
+Install this repo using SKILL.md, run all tests (unit + e2e), then run the mainnet bring-up checklist and start maker+taker peers on mainnet (with user-provided Solana RPC + Solana keypairs + LN node configuration). Report the exact commands run and any failures.
+```
+
 ---
 
 ## Conceptual Flow (BTC(LN) <> USDT(Solana))
@@ -105,6 +110,7 @@ This stack touches a few external endpoints. Defaults are chosen so local e2e is
 - Bitcoin/LN: the BTC leg is **Lightning** (CLN or LND).
   - Local e2e uses docker regtest stacks under `dev/` (includes `bitcoind`).
   - Mainnet uses your local LN node (CLN via `bitcoind` RPC, or LND via `neutrino` or `bitcoind` backend).
+  - This repo does not require a separate public Bitcoin explorer API by default.
 
 If any of your HTTP/RPC endpoints require auth headers (Bearer/API tokens), see **Authenticated API Endpoints** near the end of this README.
 
