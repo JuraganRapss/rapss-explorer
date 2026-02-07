@@ -6,7 +6,7 @@ cd "$ROOT"
 
 if [[ $# -lt 2 ]]; then
   echo "Usage: scripts/otc-maker-peer.sh <storeName> <scBridgePort> [otc-maker args...]" >&2
-  echo "Example: scripts/otc-maker-peer.sh swap-maker 49222 --otc-channel btc-usdt-sol-otc" >&2
+  echo "Example: scripts/otc-maker-peer.sh swap-maker 49222 --otc-channel 0000intercomswapbtcusdt" >&2
   exit 1
 fi
 

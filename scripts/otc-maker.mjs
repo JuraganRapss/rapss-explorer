@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-import fs from 'node:fs';
 import process from 'node:process';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import {
   createAssociatedTokenAccount,
   getAccount,
@@ -21,10 +20,12 @@ import { validateSwapEnvelope } from '../src/swap/schema.js';
 import { hashUnsignedEnvelope } from '../src/swap/hash.js';
 import { createInitialTrade, applySwapEnvelope } from '../src/swap/stateMachine.js';
 import { normalizeInvitePayload, normalizeWelcomePayload, createSignedInvite } from '../src/sidechannel/capabilities.js';
+import { normalizeClnNetwork } from '../src/ln/cln.js';
 import {
   createEscrowTx,
   LN_USDT_ESCROW_PROGRAM_ID,
 } from '../src/solana/lnUsdtEscrowClient.js';
+import { readSolanaKeypair } from '../src/solana/keypair.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 
 const execFileP = promisify(execFile);
@@ -115,22 +116,6 @@ async function signSwapEnvelope(sc, unsignedEnvelope) {
   return signed;
 }
 
-function readSolanaKeypair(filePath) {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  let arr;
-  try {
-    arr = JSON.parse(raw);
-  } catch (_e) {
-    throw new Error('Invalid Solana keypair JSON');
-  }
-  if (!Array.isArray(arr)) throw new Error('Solana keypair must be a JSON array');
-  const bytes = Uint8Array.from(arr);
-  if (bytes.length !== 64 && bytes.length !== 32) {
-    throw new Error(`Solana keypair must be 64 bytes (solana-keygen) or 32 bytes (seed), got ${bytes.length}`);
-  }
-  return bytes.length === 64 ? Keypair.fromSecretKey(bytes) : Keypair.fromSeed(bytes);
-}
-
 function quoteUsdtAmountFromOracle({ btcSats, priceUsdtPerBtc, usdtDecimals, spreadBps = 0 }) {
   const sats = BigInt(String(btcSats));
   const decimals = BigInt(String(usdtDecimals));
@@ -196,7 +181,7 @@ async function main() {
 
   const url = requireFlag(flags, 'url');
   const token = requireFlag(flags, 'token');
-  const otcChannel = (flags.get('otc-channel') && String(flags.get('otc-channel')).trim()) || 'btc-usdt-sol-otc';
+  const otcChannel = (flags.get('otc-channel') && String(flags.get('otc-channel')).trim()) || '0000intercomswapbtcusdt';
   const swapChannelTemplate =
     (flags.get('swap-channel-template') && String(flags.get('swap-channel-template')).trim()) || 'swap:{trade_id}';
   const quoteValidSec = parseIntFlag(flags.get('quote-valid-sec'), 'quote-valid-sec', 60);
@@ -227,7 +212,13 @@ async function main() {
   const lnBackend = (flags.get('ln-backend') && String(flags.get('ln-backend')).trim()) || 'docker';
   const lnComposeFile = (flags.get('ln-compose-file') && String(flags.get('ln-compose-file')).trim()) || defaultComposeFile;
   const lnService = flags.get('ln-service') ? String(flags.get('ln-service')).trim() : '';
-  const lnNetwork = (flags.get('ln-network') && String(flags.get('ln-network')).trim()) || 'regtest';
+  const lnNetworkRaw = (flags.get('ln-network') && String(flags.get('ln-network')).trim()) || 'regtest';
+  let lnNetwork;
+  try {
+    lnNetwork = normalizeClnNetwork(lnNetworkRaw);
+  } catch (err) {
+    die(err?.message ?? String(err));
+  }
   const lnCliBin = flags.get('ln-cli-bin') ? String(flags.get('ln-cli-bin')).trim() : '';
 
   const receipts = receiptsDbPath ? openTradeReceiptsStore({ dbPath: receiptsDbPath }) : null;

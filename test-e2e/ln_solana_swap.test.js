@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { spawn } from 'node:child_process';
@@ -26,6 +27,7 @@ import {
   refundEscrowTx,
   withdrawFeesTx,
 } from '../src/solana/lnUsdtEscrowClient.js';
+import { openTradeReceiptsStore } from '../src/receipts/store.js';
 
 const execFileP = promisify(execFile);
 
@@ -41,6 +43,16 @@ async function sh(cmd, args, opts = {}) {
     ...opts,
   });
   return { stdout: String(stdout || ''), stderr: String(stderr || '') };
+}
+
+async function nodeJson(args) {
+  const { stdout } = await sh('node', args);
+  const text = stdout.trim();
+  try {
+    return JSON.parse(text);
+  } catch (_e) {
+    throw new Error(`Failed to parse JSON: ${text.slice(0, 200)}`);
+  }
 }
 
 async function dockerCompose(args) {
@@ -184,6 +196,22 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
   await retry(() => btcCli(['getblockchaininfo']), { label: 'bitcoind ready', tries: 120, delayMs: 500 });
   await retry(() => clnCli('cln-alice', ['getinfo']), { label: 'cln-alice ready', tries: 120, delayMs: 500 });
   await retry(() => clnCli('cln-bob', ['getinfo']), { label: 'cln-bob ready', tries: 120, delayMs: 500 });
+
+  // Smoke: lnctl works against the docker backend.
+  const lnctlInfo = await nodeJson([
+    'scripts/lnctl.mjs',
+    'info',
+    '--backend',
+    'docker',
+    '--compose-file',
+    composeFile,
+    '--service',
+    'cln-alice',
+    '--network',
+    'regtest',
+  ]);
+  assert.equal(lnctlInfo.type, 'info');
+  assert.ok(lnctlInfo.info?.id, 'lnctl info should return an id');
 
   // Create miner wallet and mine spendable coins.
   try {
@@ -370,17 +398,42 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
     });
     await sendAndConfirm(connection, escrowTx2);
 
+    // Persist a minimal receipt so the operator can refund deterministically.
+    const runId = crypto.randomBytes(4).toString('hex');
+    const receiptsDb = path.join(repoRoot, `onchain/receipts/e2e-swaprecover-refund-${runId}.sqlite`);
+    const store = openTradeReceiptsStore({ dbPath: receiptsDb });
+    const tradeId = `e2e_refund_${runId}`;
+    store.upsertTrade(tradeId, {
+      ln_payment_hash_hex: paymentHash2,
+      sol_mint: mint.toBase58(),
+      sol_program_id: LN_USDT_ESCROW_PROGRAM_ID.toBase58(),
+      sol_refund: solAlice.publicKey.toBase58(),
+      state: 'escrowed',
+    });
+    store.close();
+    const keypairPath = path.join(repoRoot, `onchain/solana/keypairs/e2e-swaprecover-refund-${runId}.json`);
+    fs.mkdirSync(path.dirname(keypairPath), { recursive: true });
+    fs.writeFileSync(keypairPath, `${JSON.stringify(Array.from(solAlice.secretKey))}\n`, { mode: 0o600 });
+
     // Wait for timeout and refund.
     await new Promise((r) => setTimeout(r, 4000));
 
-    const { tx: refundTx2 } = await refundEscrowTx({
-      connection,
-      refund: solAlice,
-      refundTokenAccount: aliceToken,
-      mint,
-      paymentHashHex: paymentHash2,
-    });
-    await sendAndConfirm(connection, refundTx2);
+    const refundRes = await nodeJson([
+      'scripts/swaprecover.mjs',
+      'refund',
+      '--receipts-db',
+      receiptsDb,
+      '--trade-id',
+      tradeId,
+      '--solana-rpc-url',
+      'http://127.0.0.1:8899',
+      '--solana-keypair',
+      keypairPath,
+      '--commitment',
+      'confirmed',
+    ]);
+    assert.equal(refundRes.type, 'refunded');
+    assert.equal(refundRes.payment_hash_hex, paymentHash2);
 
     const st2 = await getEscrowState(connection, paymentHash2);
     assert.ok(st2, 'escrow state exists');
@@ -441,6 +494,66 @@ test('e2e: LN<->Solana escrow flows', async (t) => {
       mint,
       paymentHashHex: paymentHash3,
       preimageHex: realPreimage3,
+    });
+    await sendAndConfirm(connection, goodClaimTx);
+    const after = (await getAccount(connection, bobToken, 'confirmed')).amount;
+    assert.equal(after - before, 1_000_000n);
+  });
+
+  await t.test('negative: wrong claimant cannot claim even with correct preimage', async () => {
+    const invoiceX = await clnCli('cln-alice', ['invoice', '100000msat', 'swapX', 'swap wrong claimant']);
+    const paymentHashX = parseHex32(invoiceX.payment_hash, 'payment_hash');
+    const bolt11X = invoiceX.bolt11;
+
+    const nowX = Math.floor(Date.now() / 1000);
+    const refundAfterX = nowX + 3600;
+
+    const { tx: escrowTxX } = await createEscrowTx({
+      connection,
+      payer: solAlice,
+      payerTokenAccount: aliceToken,
+      mint,
+      paymentHashHex: paymentHashX,
+      recipient: solBob.publicKey,
+      refund: solAlice.publicKey,
+      refundAfterUnix: refundAfterX,
+      amount: 1_000_000n,
+    });
+    await sendAndConfirm(connection, escrowTxX);
+
+    // Bob pays to obtain a valid preimage.
+    const payResX = await clnCli('cln-bob', ['pay', bolt11X]);
+    const preimageX = parseHex32(payResX.payment_preimage, 'payment_preimage');
+
+    // A different signer attempts to claim with the correct preimage. Must fail.
+    const solEve = Keypair.generate();
+    const eveToken = await createAssociatedTokenAccount(connection, solAlice, mint, solEve.publicKey);
+    const { tx: badClaimTx } = await claimEscrowTx({
+      connection,
+      recipient: solEve,
+      recipientTokenAccount: eveToken,
+      mint,
+      paymentHashHex: paymentHashX,
+      preimageHex: preimageX,
+    });
+
+    let threw = false;
+    try {
+      await sendAndConfirm(connection, badClaimTx);
+    } catch (_e) {
+      threw = true;
+    }
+    assert.equal(threw, true, 'expected claim with wrong recipient signature to fail');
+
+    // Clean up: real recipient can still claim.
+    const before = (await getAccount(connection, bobToken, 'confirmed')).amount;
+    const { tx: goodClaimTx } = await claimEscrowTx({
+      connection,
+      recipient: solBob,
+      recipientTokenAccount: bobToken,
+      mint,
+      paymentHashHex: paymentHashX,
+      preimageHex: preimageX,
     });
     await sendAndConfirm(connection, goodClaimTx);
     const after = (await getAccount(connection, bobToken, 'confirmed')).amount;

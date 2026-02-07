@@ -1,14 +1,14 @@
 #!/usr/bin/env node
-import fs from 'node:fs';
 import process from 'node:process';
 
-import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import {
   createAssociatedTokenAccount,
   getAccount,
   getAssociatedTokenAddress,
 } from '@solana/spl-token';
 
+import { readSolanaKeypair } from '../src/solana/keypair.js';
 import {
   LN_USDT_ESCROW_PROGRAM_ID,
   deriveConfigPda,
@@ -101,22 +101,6 @@ function parseU64(value, label, fallback = 0n) {
   } catch (_e) {
     die(`Invalid ${label}`);
   }
-}
-
-function readSolanaKeypair(filePath) {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  let arr;
-  try {
-    arr = JSON.parse(raw);
-  } catch (_e) {
-    throw new Error('Invalid Solana keypair JSON');
-  }
-  if (!Array.isArray(arr)) throw new Error('Solana keypair must be a JSON array');
-  const bytes = Uint8Array.from(arr);
-  if (bytes.length !== 64 && bytes.length !== 32) {
-    throw new Error(`Solana keypair must be 64 bytes (solana-keygen) or 32 bytes (seed), got ${bytes.length}`);
-  }
-  return bytes.length === 64 ? Keypair.fromSecretKey(bytes) : Keypair.fromSeed(bytes);
 }
 
 async function sendAndConfirm(connection, tx, commitment) {
@@ -359,4 +343,3 @@ async function main() {
 }
 
 main().catch((err) => die(err?.stack || err?.message || String(err)));
-

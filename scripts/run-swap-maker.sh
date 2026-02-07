@@ -19,7 +19,7 @@ cd "$ROOT"
 
 STORE_NAME="${1:-swap-maker}"
 SC_PORT="${2:-49222}"
-OTC_CHANNEL="${3:-btc-usdt-sol-otc}"
+OTC_CHANNEL="${3:-0000intercomswapbtcusdt}"
 
 TOKEN_DIR="onchain/sc-bridge"
 TOKEN_FILE="${TOKEN_DIR}/${STORE_NAME}.token"

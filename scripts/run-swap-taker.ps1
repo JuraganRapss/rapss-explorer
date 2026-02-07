@@ -18,7 +18,7 @@ if (-not $inviterKeys) {
 
 $storeName = if ($args.Length -ge 1 -and $args[0]) { [string]$args[0] } else { "swap-taker" }
 $scPort = if ($args.Length -ge 2 -and $args[1]) { [string]$args[1] } else { "49223" }
-$otcChannel = if ($args.Length -ge 3 -and $args[2]) { [string]$args[2] } else { "btc-usdt-sol-otc" }
+$otcChannel = if ($args.Length -ge 3 -and $args[2]) { [string]$args[2] } else { "0000intercomswapbtcusdt" }
 
 $tokenDir = Join-Path $root "onchain/sc-bridge"
 $tokenFile = Join-Path $tokenDir ("{0}.token" -f $storeName)

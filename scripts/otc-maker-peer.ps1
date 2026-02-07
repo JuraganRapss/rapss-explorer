@@ -5,7 +5,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $root
 
 if ($args.Length -lt 2) {
-  throw "Usage: scripts\\otc-maker-peer.ps1 <storeName> <scBridgePort> [otc-maker args...]`nExample: scripts\\otc-maker-peer.ps1 swap-maker 49222 --otc-channel btc-usdt-sol-otc"
+  throw "Usage: scripts\\otc-maker-peer.ps1 <storeName> <scBridgePort> [otc-maker args...]`nExample: scripts\\otc-maker-peer.ps1 swap-maker 49222 --otc-channel 0000intercomswapbtcusdt"
 }
 
 $storeName = [string]$args[0]

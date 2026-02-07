@@ -19,7 +19,7 @@ cd "$ROOT"
 
 STORE_NAME="${1:-swap-taker}"
 SC_PORT="${2:-49223}"
-OTC_CHANNEL="${3:-btc-usdt-sol-otc}"
+OTC_CHANNEL="${3:-0000intercomswapbtcusdt}"
 
 INVITER_KEYS="${SWAP_INVITER_KEYS:-}"
 if [[ -z "$INVITER_KEYS" ]]; then

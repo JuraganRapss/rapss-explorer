@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ensure Pear + Node 22 are available in the current shell.
+# Ensure Pear + Node >= 22 are available in the current shell.
 # Intended usage:
 #   . scripts/_env.sh
 
@@ -10,7 +10,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   exit 1
 fi
 
-# Prefer Node 22 via fnm if it's available.
+# Prefer Node 22 via fnm if it's available (Pear runtime tends to be most stable there).
 if command -v fnm >/dev/null 2>&1; then
   eval "$(fnm env --shell bash)"
   fnm use 22 >/dev/null 2>&1 || true
@@ -18,18 +18,30 @@ fi
 
 # Prefer Pear's stable bin dir if present (avoids PATH warnings with some setups).
 # Note: fnm mutates PATH, so do this after fnm setup.
-PEAR_BIN="$HOME/Library/Application Support/pear/bin"
-if [[ -d "$PEAR_BIN" ]]; then
-  case ":$PATH:" in
-    *":$PEAR_BIN:"*) ;;
-    *) export PATH="$PEAR_BIN:$PATH" ;;
-  esac
-fi
+#
+# Pear stores data under:
+# - macOS: ~/Library/Application Support/pear
+# - Linux: ~/.config/pear
+# So the bin dir is commonly:
+# - macOS: ~/Library/Application Support/pear/bin
+# - Linux: ~/.config/pear/bin
+for PEAR_BIN in \
+  "$HOME/Library/Application Support/pear/bin" \
+  "$HOME/.config/pear/bin" \
+  "$HOME/.local/share/pear/bin"
+do
+  if [[ -d "$PEAR_BIN" ]]; then
+    case ":$PATH:" in
+      *":$PEAR_BIN:"*) ;;
+      *) export PATH="$PEAR_BIN:$PATH" ;;
+    esac
+  fi
+done
 
 NODE_VER="$(node -v 2>/dev/null || true)"
 NODE_MAJOR="$(echo "$NODE_VER" | sed -E 's/^v([0-9]+).*/\1/' || true)"
-if [[ "$NODE_MAJOR" != "22" ]]; then
-  echo "Node 22.x is required. Current: ${NODE_VER:-<missing>}" >&2
+if [[ -z "$NODE_MAJOR" || "$NODE_MAJOR" -lt 22 ]]; then
+  echo "Node >= 22 is required. Current: ${NODE_VER:-<missing>}" >&2
   return 1
 fi
 
