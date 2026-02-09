@@ -764,12 +764,40 @@ export class ToolExecutor {
       if (dryRun) return { type: 'dry_run', tool: toolName, channel };
       return withScBridge(this.scBridge, (sc) => sc.join(channel, { invite, welcome }));
     }
+    if (toolName === 'intercomswap_sc_join_many') {
+      assertAllowedKeys(args, toolName, ['channels']);
+      requireApproval(toolName, autoApprove);
+      if (!Array.isArray(args.channels) || args.channels.length < 1) {
+        throw new Error(`${toolName}: channels must be a non-empty array`);
+      }
+      const channels = args.channels.map((c) => normalizeChannelName(expectString({ channel: c }, toolName, 'channel', { max: 128 })));
+      if (dryRun) return { type: 'dry_run', tool: toolName, channels };
+      return withScBridge(this.scBridge, async (sc) => {
+        const out = [];
+        for (const channel of channels) out.push(await sc.join(channel, {}));
+        return { type: 'sc_join_many', channels, results: out };
+      });
+    }
     if (toolName === 'intercomswap_sc_leave') {
       assertAllowedKeys(args, toolName, ['channel']);
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       if (dryRun) return { type: 'dry_run', tool: toolName, channel };
       return withScBridge(this.scBridge, (sc) => sc.leave(channel));
+    }
+    if (toolName === 'intercomswap_sc_leave_many') {
+      assertAllowedKeys(args, toolName, ['channels']);
+      requireApproval(toolName, autoApprove);
+      if (!Array.isArray(args.channels) || args.channels.length < 1) {
+        throw new Error(`${toolName}: channels must be a non-empty array`);
+      }
+      const channels = args.channels.map((c) => normalizeChannelName(expectString({ channel: c }, toolName, 'channel', { max: 128 })));
+      if (dryRun) return { type: 'dry_run', tool: toolName, channels };
+      return withScBridge(this.scBridge, async (sc) => {
+        const out = [];
+        for (const channel of channels) out.push(await sc.leave(channel));
+        return { type: 'sc_leave_many', channels, results: out };
+      });
     }
     if (toolName === 'intercomswap_sc_open') {
       assertAllowedKeys(args, toolName, ['channel', 'via', 'invite_b64', 'welcome_b64']);

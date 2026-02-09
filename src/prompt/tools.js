@@ -118,11 +118,39 @@ export const INTERCOMSWAP_TOOLS = [
     },
     required: ['channel'],
   }),
+  tool('intercomswap_sc_join_many', 'Join multiple sidechannels (public rendezvous style).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      channels: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 50,
+        items: channelParam,
+        description: 'Channels to join.',
+      },
+    },
+    required: ['channels'],
+  }),
   tool('intercomswap_sc_leave', 'Leave a sidechannel locally (channel hygiene).', {
     type: 'object',
     additionalProperties: false,
     properties: { channel: channelParam },
     required: ['channel'],
+  }),
+  tool('intercomswap_sc_leave_many', 'Leave multiple sidechannels locally (channel hygiene).', {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      channels: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 50,
+        items: channelParam,
+        description: 'Channels to leave.',
+      },
+    },
+    required: ['channels'],
   }),
   tool('intercomswap_sc_open', 'Request/open a sidechannel via an entry channel (invite/welcome optional).', {
     type: 'object',
