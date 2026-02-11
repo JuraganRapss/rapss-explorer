@@ -322,20 +322,68 @@ async function main() {
 	    : null;
 
   let done = false;
+  let shuttingDown = false;
+
+  const safeShutdown = async (reason = 'shutdown') => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (debug) process.stderr.write(`[maker] shutdown start reason=${reason}\n`);
+    try {
+      clearInterval(lockPruneTimer);
+    } catch (_e) {}
+    for (const ctx of Array.from(swaps.values())) {
+      try {
+        if (ctx?.resender) clearInterval(ctx.resender);
+      } catch (_e) {}
+    }
+    try {
+      const st = await sc.stats();
+      const channels = Array.isArray(st?.channels) ? st.channels : [];
+      for (const ch of channels) {
+        const channel = String(ch || '').trim();
+        if (channel.startsWith('swap:')) {
+          try {
+            await sc.leave(channel);
+          } catch (_e) {}
+        }
+      }
+    } catch (_e) {}
+    for (const swapChannel of Array.from(swaps.keys())) {
+      try {
+        await sc.leave(swapChannel);
+      } catch (_e) {}
+    }
+    try {
+      receipts?.close();
+    } catch (_e) {}
+    try {
+      sc.close();
+    } catch (_e) {}
+    if (debug) process.stderr.write(`[maker] shutdown done reason=${reason}\n`);
+  };
+
+  process.on('SIGINT', () => {
+    void (async () => {
+      await safeShutdown('sigint');
+      process.exit(130);
+    })();
+  });
+  process.on('SIGTERM', () => {
+    void (async () => {
+      await safeShutdown('sigterm');
+      process.exit(143);
+    })();
+  });
 
   const maybeExit = () => {
     if (!once) return;
     if (!done) return;
     const delay = Number.isFinite(onceExitDelayMs) ? Math.max(onceExitDelayMs, 0) : 0;
     setTimeout(() => {
-      try {
-        clearInterval(lockPruneTimer);
-      } catch (_e) {}
-      try {
-        receipts?.close();
-      } catch (_e) {}
-      sc.close();
-      process.exit(0);
+      void (async () => {
+        await safeShutdown('once_done');
+        process.exit(0);
+      })();
     }, delay);
   };
 
