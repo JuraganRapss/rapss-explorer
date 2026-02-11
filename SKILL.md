@@ -510,6 +510,10 @@ A→Z operating flow:
      - `enable_quote_from_offers=true`
      - `enable_quote_from_rfqs=true`
    - For stalled swaps in `waiting_terms`, tune worker `waiting_terms_*` options (bounded retry + timeout leave) instead of adding client-side loops.
+   - For deterministic `ln_pay` fail cleanup, tune:
+     - `ln_pay_fail_leave_attempts`
+     - `ln_pay_fail_leave_min_wait_ms`
+     - `ln_pay_retry_cooldown_ms`
    - Manual fallback (same deterministic tools):
      - `intercomswap_quote_post_from_rfq`
      - `intercomswap_quote_accept`
@@ -1442,6 +1446,9 @@ E2E flakiness guidance (timing vs determinism):
 Lightning channel note:
 - LN channels are **not opened per trade**. Open channels ahead of time and reuse them for many swaps.
 - A direct channel is only between 2 LN nodes, but you can usually pay many different counterparties via routing across the LN network (if a route exists).
+- Private-channel routing note (LND):
+  - Maker swap invoices request private route hints only when active private channels exist.
+  - If the maker is private-only and invoice decode still shows no route hints, expect `NO_ROUTE` until routing visibility/hints are fixed.
 - Collin will block RFQ/Offer/Bot tools until at least one LN channel exists (to prevent “can’t settle” operator footguns).
 
 Autopost (Collin "Run as bot") safety:

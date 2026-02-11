@@ -698,11 +698,16 @@ Recently added/changed tools and guardrails:
   - trace defaults: worker trace is OFF by default; toggle explicitly with `intercomswap_tradeauto_trace_set`.
   - reliability knobs: `tool_timeout_ms` (per-tool timeout inside worker), `sc_ensure_interval_ms` (periodic SC subscribe/reconnect keepalive).
   - waiting-terms liveness knobs: `waiting_terms_*` options bound waiting-time, replay/ping cadence, and timeout leave behavior.
+  - LN pay failure determinism knobs:
+    - `ln_pay_fail_leave_attempts`: minimum repeated `ln_pay` failures before fail-leave can trigger.
+    - `ln_pay_fail_leave_min_wait_ms`: minimum elapsed time since first `ln_pay` failure before fail-leave can trigger.
+    - `ln_pay_retry_cooldown_ms`: retry cadence before fail-leave thresholds are reached.
   - ownership detection: worker resolves local peer identity from SC info shapes returned by runtime (`peer` and `info.peerPubkey` variants) to avoid false `not_owner` settlement skips.
 - `intercomswap_tradeauto_trace_set`: enable/disable backend trace emission at runtime without restarting the full stack.
 - `intercomswap_swap_status_post`: signed status/liveness envelope helper for swap channels.
 - `intercomswap_stack_start`: now auto-starts backend trade automation (rendezvous channels + settlement stages) and reports worker status/errors.
 - `intercomswap_stack_stop`: now also stops backend trade automation.
+- Swap maker invoice path (`intercomswap_swap_ln_invoice_create_and_post`) now requests private route hints only when active private LND channels exist; public-only setups are not forced into private invoice mode.
 - Autopost safety: jobs stop on insufficient-funds/liquidity errors (in addition to expiry/fill stops).
 
 When function signatures change:

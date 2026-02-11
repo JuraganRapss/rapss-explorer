@@ -358,6 +358,79 @@ test('tradeauto: RFQ auto-quote can run without offer match when enabled', async
   }
 });
 
+test('tradeauto: RFQ auto-quote is suppressed when trade already has quote_accept/invite context', async () => {
+  const tradeId = 'swap_test_rfq_busy_1';
+  const now = Date.now();
+  const posted = [];
+  const events = [
+    {
+      seq: 1,
+      ts: now,
+      channel: '0000intercomswapbtcusdt',
+      kind: 'swap.rfq',
+      message: env('swap.rfq', tradeId, TAKER, {
+        pair: 'BTC_LN/USDT_SOL',
+        direction: 'BTC_LN->USDT_SOL',
+        btc_sats: 12000,
+        usdt_amount: '1200000',
+        max_platform_fee_bps: 50,
+        max_trade_fee_bps: 50,
+        max_total_fee_bps: 100,
+        min_sol_refund_window_sec: 259200,
+        max_sol_refund_window_sec: 604800,
+        valid_until_unix: Math.floor((now + 120_000) / 1000),
+      }),
+    },
+    {
+      seq: 2,
+      ts: now + 1,
+      channel: '0000intercomswapbtcusdt',
+      kind: 'swap.quote_accept',
+      message: env('swap.quote_accept', tradeId, TAKER, {
+        rfq_id: 'd'.repeat(64),
+        quote_id: 'e'.repeat(64),
+      }),
+    },
+  ];
+
+  let readCount = 0;
+  const mgr = new TradeAutoManager({
+    scLogInfo: () => ({ latest_seq: 2 }),
+    scLogRead: () => {
+      readCount += 1;
+      if (readCount > 1) return { latest_seq: 2, events: [] };
+      return { latest_seq: 2, events };
+    },
+    runTool: async ({ tool, args }) => {
+      if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
+      if (tool === 'intercomswap_sc_info') return { peer: MAKER };
+      if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_sc_stats') return { channels: [] };
+      if (tool === 'intercomswap_quote_post_from_rfq') {
+        posted.push({ tool, args });
+        return { type: 'quote_posted' };
+      }
+      throw new Error(`unexpected tool: ${tool}`);
+    },
+  });
+
+  try {
+    await mgr.start({
+      channels: ['0000intercomswapbtcusdt'],
+      usdt_mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+      enable_quote_from_offers: false,
+      enable_quote_from_rfqs: true,
+      enable_accept_quotes: false,
+      enable_invite_from_accepts: false,
+      enable_join_invites: false,
+      enable_settlement: false,
+    });
+    assert.equal(posted.length, 0);
+  } finally {
+    await mgr.stop({ reason: 'test_done' });
+  }
+});
+
 test('tradeauto: aggregate liquidity mode is honored for RFQ auto-accept', async () => {
   const tradeId = 'swap_test_accept_aggregate_1';
   const now = Date.now();
@@ -604,6 +677,10 @@ test('tradeauto: taker waiting_terms replays quote_accept and then accepts terms
       replayCalls.some((c) => String(c?.args?.json?.kind || '') === 'swap.quote_accept'),
       'expected quote_accept replay while waiting terms'
     );
+    assert.ok(
+      replayCalls.some((c) => String(c?.args?.json?.control || '') === 'auth'),
+      'expected auth replay while waiting terms'
+    );
     assert.equal(accepted.length, 1);
     assert.equal(String(accepted[0]?.args?.channel || ''), swapChannel);
   } finally {
@@ -699,6 +776,120 @@ test('tradeauto: waiting_terms timeout auto-leaves swap channel (bounded wait)',
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.ok(left.includes(swapChannel), 'expected timeout leave on stale waiting_terms trade');
+  } finally {
+    await mgr.stop({ reason: 'test_done' });
+  }
+});
+
+test('tradeauto: ln_pay failure auto-leave is deterministic and does not leave early', async () => {
+  const tradeId = 'swap_test_6';
+  const swapChannel = `swap:${tradeId}`;
+  const now = Date.now();
+
+  const termsEnv = env('swap.terms', tradeId, MAKER, {
+    btc_sats: 1000,
+    usdt_amount: '670000',
+    sol_mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+    sol_recipient: SOL_RECIPIENT,
+    sol_refund: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM',
+    sol_refund_after_unix: Math.floor((now + 72 * 3600 * 1000) / 1000),
+    ln_receiver_peer: MAKER,
+    ln_payer_peer: TAKER,
+    trade_fee_collector: SOL_RECIPIENT,
+  });
+  const invoiceEnv = env('swap.ln_invoice', tradeId, MAKER, {
+    bolt11: 'lnbc10u1p5cemg5pp503h4ceyly03nvgevmevjv4jrlrsr3s6tg89r8surn4lext8hpnfqdygwfn8zttjvecj6vfhxucrsdpnxymrydf4x5kkydnrxenrqwp595cnwdes8q6rxdp3xgcrvvfqf9h8getjvdhk6grnwashqgrjvecj6vfhxucrsdpnxymrydf4x5kkydnrxenrqwp5cqzzsxqrrsssp5k8zm63dhvg36cjhs48ckxk2glm7lc5hk94ahjhuzpwqu68hscqlq9qxpqysgqdkwmv5hvuke35jept3g8fc46cqlupsn7juv2scmqr530u8ywdv3xxp6walt49s7tlzszjkqdwc8f4emwue5qqelqkfpxz725cxjjdcqpa8930v',
+    payment_hash_hex: '7c6f5c649f23e336232cde59265643f8e038c34b41ca33c3839d7f932cf70cd2',
+  });
+  const escrowEnv = env('swap.sol_escrow_created', tradeId, MAKER, {
+    payment_hash_hex: '7c6f5c649f23e336232cde59265643f8e038c34b41ca33c3839d7f932cf70cd2',
+    mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+    amount: '670000',
+    recipient: SOL_RECIPIENT,
+    refund: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM',
+    refund_after_unix: Math.floor((now + 72 * 3600 * 1000) / 1000),
+    trade_fee_collector: SOL_RECIPIENT,
+    tx_sig: '5'.repeat(88),
+  });
+
+  const events = [
+    {
+      seq: 1,
+      ts: now + 1,
+      channel: swapChannel,
+      kind: 'swap.terms',
+      message: termsEnv,
+    },
+    {
+      seq: 2,
+      ts: now + 2,
+      channel: swapChannel,
+      kind: 'swap.accept',
+      message: env('swap.accept', tradeId, TAKER, {}),
+    },
+    {
+      seq: 3,
+      ts: now + 3,
+      channel: swapChannel,
+      kind: 'swap.ln_invoice',
+      message: invoiceEnv,
+    },
+    {
+      seq: 4,
+      ts: now + 4,
+      channel: swapChannel,
+      kind: 'swap.sol_escrow_created',
+      message: escrowEnv,
+    },
+  ];
+
+  const left = [];
+  let lnPayAttempts = 0;
+  const mgr = new TradeAutoManager({
+    scLogInfo: () => ({ latest_seq: 4 }),
+    scLogRead: () => ({ latest_seq: 4, events }),
+    runTool: async ({ tool, args }) => {
+      if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
+      if (tool === 'intercomswap_sc_info') return { peer: TAKER };
+      if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
+      if (tool === 'intercomswap_swap_ln_pay_and_post_verified') {
+        lnPayAttempts += 1;
+        throw new Error('ln pay failed: FAILURE_REASON_NO_ROUTE');
+      }
+      if (tool === 'intercomswap_sc_leave') {
+        left.push(String(args?.channel || ''));
+        return { type: 'left', channel: String(args?.channel || '') };
+      }
+      throw new Error(`unexpected tool: ${tool}`);
+    },
+  });
+
+  try {
+    await mgr.start({
+      channels: ['0000intercomswapbtcusdt'],
+      interval_ms: 50,
+      enable_quote_from_offers: false,
+      enable_quote_from_rfqs: false,
+      enable_accept_quotes: false,
+      enable_invite_from_accepts: false,
+      enable_join_invites: false,
+      enable_settlement: true,
+      ln_pay_fail_leave_attempts: 3,
+      ln_pay_fail_leave_min_wait_ms: 200,
+      ln_pay_retry_cooldown_ms: 50,
+      swap_auto_leave_cooldown_ms: 200,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(left.length, 0, 'must not leave before deterministic thresholds');
+
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && left.length < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(lnPayAttempts >= 3, 'expected repeated ln_pay failures before leave');
+    assert.ok(left.includes(swapChannel), 'expected deterministic auto-leave after threshold');
   } finally {
     await mgr.stop({ reason: 'test_done' });
   }

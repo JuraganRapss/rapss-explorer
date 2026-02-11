@@ -338,6 +338,34 @@ function summarizeLnLiquidity(rows) {
   };
 }
 
+function countInvoiceRouteHints(decoded) {
+  if (!isObject(decoded)) return 0;
+  let count = 0;
+  const collect = (value) => {
+    if (!Array.isArray(value)) return;
+    for (const row of value) {
+      if (Array.isArray(row)) {
+        if (row.length > 0) count += 1;
+        continue;
+      }
+      if (!isObject(row)) continue;
+      const hops = Array.isArray(row?.hop_hints) ? row.hop_hints : Array.isArray(row?.hopHints) ? row.hopHints : null;
+      if (hops && hops.length > 0) {
+        count += 1;
+        continue;
+      }
+      if (Object.keys(row).length > 0) count += 1;
+    }
+  };
+  collect(decoded.route_hints);
+  collect(decoded.routeHints);
+  collect(decoded.routing_hints);
+  collect(decoded.routingHints);
+  collect(decoded.blinded_paths);
+  collect(decoded.blindedPaths);
+  return count;
+}
+
 function extractLnConnectedPeerIds(listPeers) {
   const out = [];
   const seen = new Set();
@@ -1095,6 +1123,16 @@ export class ToolExecutor {
     return this._scEnsurePersistent({ timeoutMs });
   }
 
+  async _scEnsureChannelSubscribed(channel, { timeoutMs = 10_000 } = {}) {
+    const ch = normalizeChannelName(String(channel || ''));
+    const sc = await this._scEnsurePersistent({ timeoutMs });
+    if (!this._scSubscribed.has(ch)) {
+      this._scSubscribed.add(ch);
+      await sc.subscribe([ch]);
+    }
+    return sc;
+  }
+
   _scLogAppend(evt) {
     // Append to streaming log with a monotonic seq (do not remove on consumption).
     this._scSeq += 1;
@@ -1334,6 +1372,9 @@ export class ToolExecutor {
         'waiting_terms_max_pings',
         'waiting_terms_max_wait_ms',
         'waiting_terms_leave_on_timeout',
+        'ln_pay_fail_leave_attempts',
+        'ln_pay_fail_leave_min_wait_ms',
+        'ln_pay_retry_cooldown_ms',
         'trace_enabled',
         'ln_liquidity_mode',
         'usdt_mint',
@@ -1378,6 +1419,9 @@ export class ToolExecutor {
       const waitingTermsMaxPings = expectOptionalInt(args, toolName, 'waiting_terms_max_pings', { min: 0, max: 500 });
       const waitingTermsMaxWaitMs = expectOptionalInt(args, toolName, 'waiting_terms_max_wait_ms', { min: 5_000, max: 60 * 60 * 1000 });
       const waitingTermsLeaveOnTimeout = 'waiting_terms_leave_on_timeout' in args ? expectBool(args, toolName, 'waiting_terms_leave_on_timeout') : undefined;
+      const lnPayFailLeaveAttempts = expectOptionalInt(args, toolName, 'ln_pay_fail_leave_attempts', { min: 2, max: 50 });
+      const lnPayFailLeaveMinWaitMs = expectOptionalInt(args, toolName, 'ln_pay_fail_leave_min_wait_ms', { min: 1_000, max: 60 * 60 * 1000 });
+      const lnPayRetryCooldownMs = expectOptionalInt(args, toolName, 'ln_pay_retry_cooldown_ms', { min: 250, max: 120_000 });
       const traceEnabled = 'trace_enabled' in args ? expectBool(args, toolName, 'trace_enabled') : undefined;
       const lnLiquidityModeRaw = expectOptionalString(args, toolName, 'ln_liquidity_mode', { min: 1, max: 32 });
       const lnLiquidityMode = lnLiquidityModeRaw ? String(lnLiquidityModeRaw).trim().toLowerCase() : '';
@@ -1415,6 +1459,9 @@ export class ToolExecutor {
         ...(waitingTermsMaxPings !== null ? { waiting_terms_max_pings: waitingTermsMaxPings } : {}),
         ...(waitingTermsMaxWaitMs !== null ? { waiting_terms_max_wait_ms: waitingTermsMaxWaitMs } : {}),
         ...(waitingTermsLeaveOnTimeout !== undefined ? { waiting_terms_leave_on_timeout: waitingTermsLeaveOnTimeout } : {}),
+        ...(lnPayFailLeaveAttempts !== null ? { ln_pay_fail_leave_attempts: lnPayFailLeaveAttempts } : {}),
+        ...(lnPayFailLeaveMinWaitMs !== null ? { ln_pay_fail_leave_min_wait_ms: lnPayFailLeaveMinWaitMs } : {}),
+        ...(lnPayRetryCooldownMs !== null ? { ln_pay_retry_cooldown_ms: lnPayRetryCooldownMs } : {}),
         ...(traceEnabled !== undefined ? { trace_enabled: traceEnabled } : {}),
         ...(lnLiquidityMode ? { ln_liquidity_mode: lnLiquidityMode } : {}),
         ...(usdtMint ? { usdt_mint: usdtMint } : {}),
@@ -2283,7 +2330,11 @@ export class ToolExecutor {
       const invite = inviteRaw !== null ? resolveSecretArg(secrets, inviteRaw, { label: 'invite_b64' }) : null;
       const welcome = welcomeRaw !== null ? resolveSecretArg(secrets, welcomeRaw, { label: 'welcome_b64' }) : null;
       if (dryRun) return { type: 'dry_run', tool: toolName, channel };
-      return withScBridge(this.scBridge, (sc) => sc.join(channel, { invite, welcome }));
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      const res = await sc.join(channel, { invite, welcome });
+      this._scSubscribed.add(channel);
+      await sc.subscribe([channel]);
+      return res;
     }
     if (toolName === 'intercomswap_sc_join_many') {
       assertAllowedKeys(args, toolName, ['channels']);
@@ -2293,18 +2344,24 @@ export class ToolExecutor {
       }
       const channels = args.channels.map((c) => normalizeChannelName(expectString({ channel: c }, toolName, 'channel', { max: 128 })));
       if (dryRun) return { type: 'dry_run', tool: toolName, channels };
-      return withScBridge(this.scBridge, async (sc) => {
-        const out = [];
-        for (const channel of channels) out.push(await sc.join(channel, {}));
-        return { type: 'sc_join_many', channels, results: out };
-      });
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      const out = [];
+      for (const channel of channels) {
+        out.push(await sc.join(channel, {}));
+        this._scSubscribed.add(channel);
+      }
+      await sc.subscribe(channels);
+      return { type: 'sc_join_many', channels, results: out };
     }
     if (toolName === 'intercomswap_sc_leave') {
       assertAllowedKeys(args, toolName, ['channel']);
       requireApproval(toolName, autoApprove);
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       if (dryRun) return { type: 'dry_run', tool: toolName, channel };
-      return withScBridge(this.scBridge, (sc) => sc.leave(channel));
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      const res = await sc.leave(channel);
+      this._scSubscribed.delete(channel);
+      return res;
     }
     if (toolName === 'intercomswap_sc_leave_many') {
       assertAllowedKeys(args, toolName, ['channels']);
@@ -2314,11 +2371,13 @@ export class ToolExecutor {
       }
       const channels = args.channels.map((c) => normalizeChannelName(expectString({ channel: c }, toolName, 'channel', { max: 128 })));
       if (dryRun) return { type: 'dry_run', tool: toolName, channels };
-      return withScBridge(this.scBridge, async (sc) => {
-        const out = [];
-        for (const channel of channels) out.push(await sc.leave(channel));
-        return { type: 'sc_leave_many', channels, results: out };
-      });
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      const out = [];
+      for (const channel of channels) {
+        out.push(await sc.leave(channel));
+        this._scSubscribed.delete(channel);
+      }
+      return { type: 'sc_leave_many', channels, results: out };
     }
     if (toolName === 'intercomswap_sc_open') {
       assertAllowedKeys(args, toolName, ['channel', 'via', 'invite_b64', 'welcome_b64']);
@@ -2330,7 +2389,11 @@ export class ToolExecutor {
       const invite = inviteRaw !== null ? resolveSecretArg(secrets, inviteRaw, { label: 'invite_b64' }) : null;
       const welcome = welcomeRaw !== null ? resolveSecretArg(secrets, welcomeRaw, { label: 'welcome_b64' }) : null;
       if (dryRun) return { type: 'dry_run', tool: toolName, channel, via };
-      return withScBridge(this.scBridge, (sc) => sc.open(channel, { via, invite, welcome }));
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      const res = await sc.open(channel, { via, invite, welcome });
+      this._scSubscribed.add(channel);
+      await sc.subscribe([channel]);
+      return res;
     }
     if (toolName === 'intercomswap_sc_send_text') {
       assertAllowedKeys(args, toolName, ['channel', 'text']);
@@ -2338,7 +2401,14 @@ export class ToolExecutor {
       const channel = normalizeChannelName(expectString(args, toolName, 'channel', { max: 128 }));
       const text = expectString(args, toolName, 'text', { min: 1, max: 2000 });
       if (dryRun) return { type: 'dry_run', tool: toolName, channel };
-      return withScBridge(this.scBridge, (sc) => sc.send(channel, text));
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      if (!this._scSubscribed.has(channel)) {
+        this._scSubscribed.add(channel);
+        await sc.subscribe([channel]);
+      }
+      const res = await sc.send(channel, text);
+      if (res?.type === 'error') throw new Error(res?.error || 'send failed');
+      return res;
     }
     if (toolName === 'intercomswap_sc_send_json') {
       assertAllowedKeys(args, toolName, ['channel', 'json']);
@@ -2349,7 +2419,14 @@ export class ToolExecutor {
       const size = Buffer.byteLength(safeJsonStringify(args.json), 'utf8');
       if (size > 16_384) throw new Error(`${toolName}: json too large (${size} bytes)`);
       if (dryRun) return { type: 'dry_run', tool: toolName, channel };
-      return withScBridge(this.scBridge, (sc) => sc.send(channel, args.json));
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      if (!this._scSubscribed.has(channel)) {
+        this._scSubscribed.add(channel);
+        await sc.subscribe([channel]);
+      }
+      const res = await sc.send(channel, args.json);
+      if (res?.type === 'error') throw new Error(res?.error || 'send failed');
+      return res;
     }
 
     // RFQ / swap envelopes (signed + broadcast)
@@ -3036,26 +3113,27 @@ export class ToolExecutor {
       });
       const signed = signSwapEnvelope(unsigned, signing);
 
-      return withScBridge(this.scBridge, async (sc) => {
-        await this._sendEnvelopeLogged(sc, channel, signed);
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      await this._sendEnvelopeLogged(sc, channel, signed);
 
-        // Ensure the maker peer has joined and verified the dynamic welcome, otherwise it will drop
-        // inbound messages on swap:* until welcomed.
-        const joinRes = await sc.join(swapChannel, { welcome });
-        if (joinRes?.type === 'error') throw new Error(joinRes.error || 'join failed');
+      // Ensure the maker peer has joined and verified the dynamic welcome on the same persistent
+      // SC session used by backend automation.
+      const joinRes = await sc.join(swapChannel, { welcome });
+      if (joinRes?.type === 'error') throw new Error(joinRes.error || 'join failed');
+      this._scSubscribed.add(swapChannel);
+      await sc.subscribe([swapChannel]);
 
-        return {
-          type: 'swap_invite_posted',
-          channel,
-          swap_channel: swapChannel,
-          owner_pubkey: ownerPubKey,
-          envelope: signed,
-          invite,
-          welcome,
-          maker_join: joinRes,
-          counterparty_liquidity_check: counterpartyLiquidityCheck,
-        };
-      });
+      return {
+        type: 'swap_invite_posted',
+        channel,
+        swap_channel: swapChannel,
+        owner_pubkey: ownerPubKey,
+        envelope: signed,
+        invite,
+        welcome,
+        maker_join: joinRes,
+        counterparty_liquidity_check: counterpartyLiquidityCheck,
+      };
     }
 
     if (toolName === 'intercomswap_join_from_swap_invite') {
@@ -3108,66 +3186,67 @@ export class ToolExecutor {
       }
 
       if (dryRun) return { type: 'dry_run', tool: toolName, swap_channel: swapChannel };
-      return withScBridge(this.scBridge, async (sc) => {
-        try {
-          const addRes = await sc.addInviterKey(resolvedInviter);
-          if (addRes?.type === 'error') {
-            throw new Error(addRes?.error || 'inviter_add failed');
+      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+      try {
+        const addRes = await sc.addInviterKey(resolvedInviter);
+        if (addRes?.type === 'error') {
+          throw new Error(addRes?.error || 'inviter_add failed');
+        }
+      } catch (err) {
+        throw new Error(
+          `${toolName}: failed to register inviter key ${resolvedInviter} before join: ${err?.message || String(err)}`
+        );
+      }
+
+      // Persist learned inviter key in local peer state, so restarts keep working.
+      try {
+        const { peerStatus, peerAddInviterKey } = await import('../peer/peerManager.js');
+        const status = peerStatus({ repoRoot: process.cwd(), name: '' });
+        const scPort = (() => {
+          try {
+            const u = new URL(String(this.scBridge?.url || '').trim());
+            const p = u.port ? Number.parseInt(u.port, 10) : 0;
+            return Number.isFinite(p) && p > 0 ? p : 49222;
+          } catch (_e) {
+            return 49222;
           }
-        } catch (err) {
-          throw new Error(
-            `${toolName}: failed to register inviter key ${resolvedInviter} before join: ${err?.message || String(err)}`
-          );
+        })();
+        const activePeer =
+          Array.isArray(status?.peers)
+            ? status.peers.find((p) => Boolean(p?.alive) && Number(p?.sc_bridge?.port) === scPort)
+            : null;
+        const peerName = String(activePeer?.name || '').trim();
+        if (peerName) {
+          await peerAddInviterKey({ repoRoot: process.cwd(), name: peerName, pubkey: resolvedInviter });
         }
+      } catch (_e) {}
 
-        // Persist learned inviter key in local peer state, so restarts keep working.
-        try {
-          const { peerStatus, peerAddInviterKey } = await import('../peer/peerManager.js');
-          const status = peerStatus({ repoRoot: process.cwd(), name: '' });
-          const scPort = (() => {
-            try {
-              const u = new URL(String(this.scBridge?.url || '').trim());
-              const p = u.port ? Number.parseInt(u.port, 10) : 0;
-              return Number.isFinite(p) && p > 0 ? p : 49222;
-            } catch (_e) {
-              return 49222;
-            }
-          })();
-          const activePeer =
-            Array.isArray(status?.peers)
-              ? status.peers.find((p) => Boolean(p?.alive) && Number(p?.sc_bridge?.port) === scPort)
-              : null;
-          const peerName = String(activePeer?.name || '').trim();
-          if (peerName) {
-            await peerAddInviterKey({ repoRoot: process.cwd(), name: peerName, pubkey: resolvedInviter });
-          }
-        } catch (_e) {}
+      const joinRes = await sc.join(swapChannel, { invite, welcome });
+      if (joinRes?.type === 'error') {
+        const msg = String(joinRes?.error || 'join failed');
+        throw new Error(`${toolName}: ${msg}`);
+      }
 
-        const joinRes = await sc.join(swapChannel, { invite, welcome });
-        if (joinRes?.type === 'error') {
-          const msg = String(joinRes?.error || 'join failed');
-          throw new Error(`${toolName}: ${msg}`);
-        }
+      this._scSubscribed.add(swapChannel);
+      await sc.subscribe([swapChannel]);
+      let authSent = false;
+      let authError = null;
+      try {
+        const auth = await sc.send(swapChannel, { control: 'auth', invite });
+        if (auth?.type === 'error') throw new Error(String(auth?.error || 'auth send failed'));
+        authSent = true;
+      } catch (err) {
+        authError = err?.message || String(err);
+      }
 
-        // Keep promptd's persistent stream subscribed too (not only this ephemeral join RPC socket),
-        // otherwise backend automation can miss follow-up swap events after a successful join.
-        this._scSubscribed.add(swapChannel);
-        try {
-          const psc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
-          await psc.subscribe([swapChannel]);
-        } catch (err) {
-          throw new Error(
-            `${toolName}: joined ${swapChannel} but failed to subscribe persistent stream: ${err?.message || String(err)}`
-          );
-        }
-
-        return {
-          ...(joinRes && typeof joinRes === 'object' ? joinRes : { type: 'joined', channel: swapChannel }),
-          swap_channel: swapChannel,
-          watched: true,
-          inviter_key: resolvedInviter,
-        };
-      });
+      return {
+        ...(joinRes && typeof joinRes === 'object' ? joinRes : { type: 'joined', channel: swapChannel }),
+        swap_channel: swapChannel,
+        watched: true,
+        inviter_key: resolvedInviter,
+        auth_sent: authSent,
+        ...(authError ? { auth_error: authError } : {}),
+      };
     }
 
     // Peer manager (local pear run processes; does not grant shell access)
@@ -3455,34 +3534,33 @@ export class ToolExecutor {
       const signing = await this._requirePeerSigning();
       const store = await this._openReceiptsStore({ required: true });
       try {
-        return await withScBridge(this.scBridge, async (sc) => {
-          const signed = signSwapEnvelope(unsigned, signing);
-          await this._sendEnvelopeLogged(sc, channel, signed);
+        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+        const signed = signSwapEnvelope(unsigned, signing);
+        await this._sendEnvelopeLogged(sc, channel, signed);
 
-          const programId = this._programId().toBase58();
-          store.upsertTrade(tradeId, {
-            role: 'maker',
-            swap_channel: channel,
-            maker_peer: String(signed.signer || '').trim().toLowerCase() || lnReceiverPeer,
-            taker_peer: lnPayerPeer,
-            btc_sats: btcSats,
-            usdt_amount: usdtAmount,
-            sol_mint: solMint,
-            sol_program_id: programId,
-            sol_recipient: solRecipient,
-            sol_refund: solRefund,
-            sol_refund_after_unix: solRefundAfter,
-            state: 'terms',
-            last_error: null,
-          });
-          store.appendEvent(tradeId, 'terms_post', {
-            terms_hash: hashTermsEnvelope(signed),
-            channel,
-            program_id: programId,
-          });
-
-          return { type: 'terms_posted', channel, terms_hash: hashTermsEnvelope(signed), envelope: signed };
+        const programId = this._programId().toBase58();
+        store.upsertTrade(tradeId, {
+          role: 'maker',
+          swap_channel: channel,
+          maker_peer: String(signed.signer || '').trim().toLowerCase() || lnReceiverPeer,
+          taker_peer: lnPayerPeer,
+          btc_sats: btcSats,
+          usdt_amount: usdtAmount,
+          sol_mint: solMint,
+          sol_program_id: programId,
+          sol_recipient: solRecipient,
+          sol_refund: solRefund,
+          sol_refund_after_unix: solRefundAfter,
+          state: 'terms',
+          last_error: null,
         });
+        store.appendEvent(tradeId, 'terms_post', {
+          terms_hash: hashTermsEnvelope(signed),
+          channel,
+          program_id: programId,
+        });
+
+        return { type: 'terms_posted', channel, terms_hash: hashTermsEnvelope(signed), envelope: signed };
       } finally {
         store.close();
       }
@@ -3505,18 +3583,17 @@ export class ToolExecutor {
       const signing = await this._requirePeerSigning();
       const store = await this._openReceiptsStore({ required: true });
       try {
-        return await withScBridge(this.scBridge, async (sc) => {
-          const signed = signSwapEnvelope(unsigned, signing);
-          await this._sendEnvelopeLogged(sc, channel, signed);
-          store.upsertTrade(tradeId, {
-            role: 'taker',
-            swap_channel: channel,
-            state: 'accepted',
-            last_error: null,
-          });
-          store.appendEvent(tradeId, 'terms_accept', { channel, terms_hash: termsHash });
-          return { type: 'terms_accept_posted', channel, envelope: signed };
+        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+        const signed = signSwapEnvelope(unsigned, signing);
+        await this._sendEnvelopeLogged(sc, channel, signed);
+        store.upsertTrade(tradeId, {
+          role: 'taker',
+          swap_channel: channel,
+          state: 'accepted',
+          last_error: null,
         });
+        store.appendEvent(tradeId, 'terms_accept', { channel, terms_hash: termsHash });
+        return { type: 'terms_accept_posted', channel, envelope: signed };
       } finally {
         store.close();
       }
@@ -3546,11 +3623,10 @@ export class ToolExecutor {
       if (dryRun) return { type: 'dry_run', tool: toolName, channel, trade_id: tradeId, state };
 
       const signing = await this._requirePeerSigning();
-      return withScBridge(this.scBridge, async (sc) => {
-        const signed = signSwapEnvelope(unsigned, signing);
-        await this._sendEnvelopeLogged(sc, channel, signed);
-        return { type: 'status_posted', channel, trade_id: tradeId, state, envelope: signed };
-      });
+      const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+      const signed = signSwapEnvelope(unsigned, signing);
+      await this._sendEnvelopeLogged(sc, channel, signed);
+      return { type: 'status_posted', channel, trade_id: tradeId, state, envelope: signed };
     }
 
     if (toolName === 'intercomswap_terms_accept_from_terms') {
@@ -3585,33 +3661,32 @@ export class ToolExecutor {
       const signing = await this._requirePeerSigning();
       const store = await this._openReceiptsStore({ required: true });
       try {
-        return await withScBridge(this.scBridge, async (sc) => {
-          const signed = signSwapEnvelope(unsigned, signing);
-          await this._sendEnvelopeLogged(sc, channel, signed);
-          const body = isObject(terms.body) ? terms.body : {};
-          const btcSats = Number.isFinite(Number(body.btc_sats)) ? Math.trunc(Number(body.btc_sats)) : null;
-          const usdtAmount = typeof body.usdt_amount === 'string' ? body.usdt_amount : null;
-          const programId = this._programId().toBase58();
-          store.upsertTrade(tradeId, {
-            role: 'taker',
-            swap_channel: channel,
-            maker_peer: String(terms.signer || '').trim().toLowerCase() || null,
-            taker_peer: String(signed.signer || '').trim().toLowerCase() || null,
-            btc_sats: btcSats ?? undefined,
-            usdt_amount: usdtAmount ?? undefined,
-            sol_mint: typeof body.sol_mint === 'string' ? body.sol_mint : undefined,
-            sol_program_id: programId,
-            sol_recipient: typeof body.sol_recipient === 'string' ? body.sol_recipient : undefined,
-            sol_refund: typeof body.sol_refund === 'string' ? body.sol_refund : undefined,
-            sol_refund_after_unix: Number.isFinite(Number(body.sol_refund_after_unix))
-              ? Math.trunc(Number(body.sol_refund_after_unix))
-              : undefined,
-            state: 'accepted',
-            last_error: null,
-          });
-          store.appendEvent(tradeId, 'terms_accept', { channel, terms_hash: termsHash, program_id: programId });
-          return { type: 'terms_accept_posted', channel, trade_id: tradeId, terms_hash_hex: termsHash, envelope: signed };
+        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+        const signed = signSwapEnvelope(unsigned, signing);
+        await this._sendEnvelopeLogged(sc, channel, signed);
+        const body = isObject(terms.body) ? terms.body : {};
+        const btcSats = Number.isFinite(Number(body.btc_sats)) ? Math.trunc(Number(body.btc_sats)) : null;
+        const usdtAmount = typeof body.usdt_amount === 'string' ? body.usdt_amount : null;
+        const programId = this._programId().toBase58();
+        store.upsertTrade(tradeId, {
+          role: 'taker',
+          swap_channel: channel,
+          maker_peer: String(terms.signer || '').trim().toLowerCase() || null,
+          taker_peer: String(signed.signer || '').trim().toLowerCase() || null,
+          btc_sats: btcSats ?? undefined,
+          usdt_amount: usdtAmount ?? undefined,
+          sol_mint: typeof body.sol_mint === 'string' ? body.sol_mint : undefined,
+          sol_program_id: programId,
+          sol_recipient: typeof body.sol_recipient === 'string' ? body.sol_recipient : undefined,
+          sol_refund: typeof body.sol_refund === 'string' ? body.sol_refund : undefined,
+          sol_refund_after_unix: Number.isFinite(Number(body.sol_refund_after_unix))
+            ? Math.trunc(Number(body.sol_refund_after_unix))
+            : undefined,
+          state: 'accepted',
+          last_error: null,
         });
+        store.appendEvent(tradeId, 'terms_accept', { channel, terms_hash: termsHash, program_id: programId });
+        return { type: 'terms_accept_posted', channel, trade_id: tradeId, terms_hash_hex: termsHash, envelope: signed };
       } finally {
         store.close();
       }
@@ -4380,7 +4455,29 @@ export class ToolExecutor {
       const store = await this._openReceiptsStore({ required: true });
       try {
       const amountMsat = (BigInt(String(btcSats)) * 1000n).toString();
-      const invoice = await lnInvoice(this.ln, { amountMsat, label, description, expirySec });
+      const lnImpl = String(this?.ln?.impl || '').trim().toLowerCase();
+      let activePublic = 0;
+      let activePrivate = 0;
+      if (lnImpl === 'lnd') {
+        try {
+          const chanRes = await lnListChannels(this.ln);
+          const rows = normalizeLnChannels({ impl: this?.ln?.impl, listChannels: chanRes, listFunds: null });
+          for (const row of rows) {
+            if (!row?.active) continue;
+            if (row?.private) activePrivate += 1;
+            else activePublic += 1;
+          }
+        } catch (_e) {}
+      }
+      const usePrivateRouteHints = lnImpl === 'lnd' && activePrivate > 0;
+      const invoice = await lnInvoice(this.ln, {
+        amountMsat,
+        label,
+        description,
+        expirySec,
+        // Only request private route hints when active private channels exist.
+        privateRouteHints: usePrivateRouteHints,
+      });
       const bolt11 = String(invoice?.bolt11 || '').trim();
       const paymentHashHex = String(invoice?.payment_hash || '').trim().toLowerCase();
       if (!bolt11) throw new Error(`${toolName}: invoice missing bolt11`);
@@ -4388,14 +4485,23 @@ export class ToolExecutor {
 
       // Best-effort decode for expiry.
       let expiresAtUnix = null;
+      let routeHintCount = null;
       try {
         const dec = await lnDecodePay(this.ln, { bolt11 });
+        routeHintCount = countInvoiceRouteHints(dec);
         const created = Number(dec?.created_at ?? dec?.timestamp ?? dec?.creation_date ?? null);
         const exp = Number(dec?.expiry ?? dec?.expiry_seconds ?? null);
         if (Number.isFinite(created) && created > 0 && Number.isFinite(exp) && exp > 0) {
           expiresAtUnix = Math.trunc(created + exp);
         }
       } catch (_e) {}
+
+      // Guardrail: private-only active topology without route hints is very likely unroutable for counterparties.
+      if (lnImpl === 'lnd' && activePrivate > 0 && activePublic < 1 && routeHintCount === 0) {
+        throw new Error(
+          `${toolName}: generated invoice has no route hints while only private active channels are available; this is likely unroutable (NO_ROUTE).`
+        );
+      }
 
       const unsigned = createUnsignedEnvelope({
         v: 1,
@@ -4426,24 +4532,23 @@ export class ToolExecutor {
       });
 
       const signing = await this._requirePeerSigning();
-      return await withScBridge(this.scBridge, async (sc) => {
-        const signed = signSwapEnvelope(unsigned, signing);
-        await this._sendEnvelopeLogged(sc, channel, signed);
-        store.appendEvent(tradeId, 'ln_invoice_posted', { channel, payment_hash_hex: paymentHashHex });
-        const envHandle = secrets && typeof secrets.put === 'function'
-          ? secrets.put(signed, { key: 'ln_invoice', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-          : null;
-        return {
-          type: 'ln_invoice_posted',
-          channel,
-          trade_id: tradeId,
-          payment_hash_hex: paymentHashHex,
-          bolt11,
-          expires_at_unix: expiresAtUnix,
-          envelope_handle: envHandle,
-          envelope: envHandle ? null : signed,
-        };
-      });
+      const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+      const signed = signSwapEnvelope(unsigned, signing);
+      await this._sendEnvelopeLogged(sc, channel, signed);
+      store.appendEvent(tradeId, 'ln_invoice_posted', { channel, payment_hash_hex: paymentHashHex });
+      const envHandle = secrets && typeof secrets.put === 'function'
+        ? secrets.put(signed, { key: 'ln_invoice', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+        : null;
+      return {
+        type: 'ln_invoice_posted',
+        channel,
+        trade_id: tradeId,
+        payment_hash_hex: paymentHashHex,
+        bolt11,
+        expires_at_unix: expiresAtUnix,
+        envelope_handle: envHandle,
+        envelope: envHandle ? null : signed,
+      };
       } finally {
         store.close();
       }
@@ -4559,26 +4664,25 @@ export class ToolExecutor {
       });
 
       const signing = await this._requirePeerSigning();
-      return await withScBridge(this.scBridge, async (sc) => {
-        const signed = signSwapEnvelope(unsigned, signing);
-        await this._sendEnvelopeLogged(sc, channel, signed);
-        store.appendEvent(tradeId, 'sol_escrow_posted', { channel, payment_hash_hex: paymentHashHex });
-        const envHandle = secrets && typeof secrets.put === 'function'
-          ? secrets.put(signed, { key: 'sol_escrow_created', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-          : null;
-        return {
-          type: 'sol_escrow_posted',
-          channel,
-          trade_id: tradeId,
-          payment_hash_hex: paymentHashHex,
-          program_id: programId.toBase58(),
-          escrow_pda: build.escrowPda.toBase58(),
-          vault_ata: build.vault.toBase58(),
-          tx_sig: escrowSig,
-          envelope_handle: envHandle,
-          envelope: envHandle ? null : signed,
-        };
-      });
+      const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+      const signed = signSwapEnvelope(unsigned, signing);
+      await this._sendEnvelopeLogged(sc, channel, signed);
+      store.appendEvent(tradeId, 'sol_escrow_posted', { channel, payment_hash_hex: paymentHashHex });
+      const envHandle = secrets && typeof secrets.put === 'function'
+        ? secrets.put(signed, { key: 'sol_escrow_created', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+        : null;
+      return {
+        type: 'sol_escrow_posted',
+        channel,
+        trade_id: tradeId,
+        payment_hash_hex: paymentHashHex,
+        program_id: programId.toBase58(),
+        escrow_pda: build.escrowPda.toBase58(),
+        vault_ata: build.vault.toBase58(),
+        tx_sig: escrowSig,
+        envelope_handle: envHandle,
+        envelope: envHandle ? null : signed,
+      };
       } finally {
         store.close();
       }
@@ -4702,23 +4806,22 @@ export class ToolExecutor {
         });
 
         const signing = await this._requirePeerSigning();
-        return await withScBridge(this.scBridge, async (sc) => {
-          const signed = signSwapEnvelope(unsigned, signing);
-          await this._sendEnvelopeLogged(sc, channel, signed);
-          store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
-          const envHandle = secrets && typeof secrets.put === 'function'
-            ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-            : null;
-          return {
-            type: 'ln_paid_posted',
-            channel,
-            trade_id: tradeId,
-            payment_hash_hex: paymentHashHex,
-            preimage_hex: preimageHex,
-            envelope_handle: envHandle,
-            envelope: envHandle ? null : signed,
-          };
-        });
+        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+        const signed = signSwapEnvelope(unsigned, signing);
+        await this._sendEnvelopeLogged(sc, channel, signed);
+        store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
+        const envHandle = secrets && typeof secrets.put === 'function'
+          ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+          : null;
+        return {
+          type: 'ln_paid_posted',
+          channel,
+          trade_id: tradeId,
+          payment_hash_hex: paymentHashHex,
+          preimage_hex: preimageHex,
+          envelope_handle: envHandle,
+          envelope: envHandle ? null : signed,
+        };
       } finally {
         store.close();
       }
@@ -4770,23 +4873,22 @@ export class ToolExecutor {
         });
 
         const signing = await this._requirePeerSigning();
-        return await withScBridge(this.scBridge, async (sc) => {
-          const signed = signSwapEnvelope(unsigned, signing);
-          await this._sendEnvelopeLogged(sc, channel, signed);
-          store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
-          const envHandle = secrets && typeof secrets.put === 'function'
-            ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-            : null;
-          return {
-            type: 'ln_paid_posted',
-            channel,
-            trade_id: tradeId,
-            payment_hash_hex: paymentHashHex,
-            preimage_hex: preimageHex,
-            envelope_handle: envHandle,
-            envelope: envHandle ? null : signed,
-          };
-        });
+        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+        const signed = signSwapEnvelope(unsigned, signing);
+        await this._sendEnvelopeLogged(sc, channel, signed);
+        store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
+        const envHandle = secrets && typeof secrets.put === 'function'
+          ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+          : null;
+        return {
+          type: 'ln_paid_posted',
+          channel,
+          trade_id: tradeId,
+          payment_hash_hex: paymentHashHex,
+          preimage_hex: preimageHex,
+          envelope_handle: envHandle,
+          envelope: envHandle ? null : signed,
+        };
       } finally {
         store.close();
       }
@@ -4893,23 +4995,22 @@ export class ToolExecutor {
         });
 
         const signing = await this._requirePeerSigning();
-        return await withScBridge(this.scBridge, async (sc) => {
-          const signed = signSwapEnvelope(unsigned, signing);
-          await this._sendEnvelopeLogged(sc, channel, signed);
-          store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
-          const envHandle = secrets && typeof secrets.put === 'function'
-            ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-            : null;
-          return {
-            type: 'ln_paid_posted',
-            channel,
-            trade_id: tradeId,
-            payment_hash_hex: paymentHashHex,
-            preimage_hex: preimageHex,
-            envelope_handle: envHandle,
-            envelope: envHandle ? null : signed,
-          };
-        });
+        const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+        const signed = signSwapEnvelope(unsigned, signing);
+        await this._sendEnvelopeLogged(sc, channel, signed);
+        store.appendEvent(tradeId, 'ln_paid_posted', { channel, payment_hash_hex: paymentHashHex });
+        const envHandle = secrets && typeof secrets.put === 'function'
+          ? secrets.put(signed, { key: 'ln_paid', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+          : null;
+        return {
+          type: 'ln_paid_posted',
+          channel,
+          trade_id: tradeId,
+          payment_hash_hex: paymentHashHex,
+          preimage_hex: preimageHex,
+          envelope_handle: envHandle,
+          envelope: envHandle ? null : signed,
+        };
       } finally {
         store.close();
       }
@@ -4993,13 +5094,13 @@ export class ToolExecutor {
       });
 
 		      const signing = await this._requirePeerSigning();
-		      return await withScBridge(this.scBridge, async (sc) => {
-		        const signed = signSwapEnvelope(unsigned, signing);
-		        await this._sendEnvelopeLogged(sc, channel, signed);
-		        store.appendEvent(tradeId, 'sol_claimed_posted', { channel, payment_hash_hex: paymentHashHex });
-		        const envHandle = secrets && typeof secrets.put === 'function'
-		          ? secrets.put(signed, { key: 'sol_claimed', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-		          : null;
+		      const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
+		      const signed = signSwapEnvelope(unsigned, signing);
+		      await this._sendEnvelopeLogged(sc, channel, signed);
+		      store.appendEvent(tradeId, 'sol_claimed_posted', { channel, payment_hash_hex: paymentHashHex });
+		      const envHandle = secrets && typeof secrets.put === 'function'
+		        ? secrets.put(signed, { key: 'sol_claimed', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+		        : null;
 	        return {
           type: 'sol_claimed_posted',
           channel,
@@ -5010,7 +5111,6 @@ export class ToolExecutor {
           envelope_handle: envHandle,
           envelope: envHandle ? null : signed,
         };
-      });
       } finally {
         store.close();
       }

@@ -239,6 +239,7 @@ export class TradeAutoManager {
     this._cachedLocalPeer = '';
     this._cachedLocalSolSigner = '';
     this._waitingTermsState = new Map(); // trade_id -> { firstSeenAt,lastTs,lastTraceAt,lastPingAt,nextPingAt,pings,timedOutAt }
+    this._lnPayFailByTrade = new Map(); // trade_id -> { channel, failures, firstFailAt, lastFailAt, abortedAt, abortReason, lastAbortTraceAt }
 
     this._stats = {
       ticks: 0,
@@ -310,6 +311,7 @@ export class TradeAutoManager {
         swap_auto_leave_by_trade: this._swapAutoLeaveByTrade.size,
         event_seen: this._eventSeenAt.size,
         waiting_terms_state: this._waitingTermsState.size,
+        ln_pay_fail_by_trade: this._lnPayFailByTrade.size,
         debug_events: this._debugEvents.length,
       },
       recent_events: this._debugEvents.slice(-Math.min(200, this._debugMax)),
@@ -429,6 +431,21 @@ export class TradeAutoManager {
       fallback: 3 * 60 * 1000,
     });
     const waitingTermsLeaveOnTimeout = opts.waiting_terms_leave_on_timeout !== false;
+    const lnPayFailLeaveAttempts = clampInt(toIntOrNull(opts.ln_pay_fail_leave_attempts), {
+      min: 2,
+      max: 50,
+      fallback: 3,
+    });
+    const lnPayFailLeaveMinWaitMs = clampInt(toIntOrNull(opts.ln_pay_fail_leave_min_wait_ms), {
+      min: 1_000,
+      max: 60 * 60 * 1000,
+      fallback: 20_000,
+    });
+    const lnPayRetryCooldownMs = clampInt(toIntOrNull(opts.ln_pay_retry_cooldown_ms), {
+      min: 250,
+      max: 120_000,
+      fallback: 10_000,
+    });
     const traceEnabled = opts.trace_enabled === true;
 
     const lnLiquidityModeRaw = String(opts.ln_liquidity_mode || 'aggregate').trim().toLowerCase();
@@ -461,6 +478,9 @@ export class TradeAutoManager {
       waiting_terms_max_pings: waitingTermsMaxPings,
       waiting_terms_max_wait_ms: waitingTermsMaxWaitMs,
       waiting_terms_leave_on_timeout: waitingTermsLeaveOnTimeout,
+      ln_pay_fail_leave_attempts: lnPayFailLeaveAttempts,
+      ln_pay_fail_leave_min_wait_ms: lnPayFailLeaveMinWaitMs,
+      ln_pay_retry_cooldown_ms: lnPayRetryCooldownMs,
       trace_enabled: traceEnabled,
       ln_liquidity_mode: lnLiquidityMode,
       usdt_mint: usdtMint || null,
@@ -506,6 +526,7 @@ export class TradeAutoManager {
     this._cachedLocalPeer = '';
     this._cachedLocalSolSigner = '';
     this._waitingTermsState.clear();
+    this._lnPayFailByTrade.clear();
 
     this._stats = {
       ticks: 0,
@@ -530,6 +551,9 @@ export class TradeAutoManager {
       waiting_terms_max_pings: waitingTermsMaxPings,
       waiting_terms_max_wait_ms: waitingTermsMaxWaitMs,
       waiting_terms_leave_on_timeout: waitingTermsLeaveOnTimeout,
+      ln_pay_fail_leave_attempts: lnPayFailLeaveAttempts,
+      ln_pay_fail_leave_min_wait_ms: lnPayFailLeaveMinWaitMs,
+      ln_pay_retry_cooldown_ms: lnPayRetryCooldownMs,
       trace_enabled: traceEnabled,
       enable_quote_from_rfqs: opts.enable_quote_from_rfqs === true,
     });
@@ -577,6 +601,7 @@ export class TradeAutoManager {
     this._cachedLocalPeer = '';
     this._cachedLocalSolSigner = '';
     this._waitingTermsState.clear();
+    this._lnPayFailByTrade.clear();
     this._traceEnabled = false;
     this._trace('tradeauto_stop', { reason: String(reason || 'stopped') });
     return { type: 'tradeauto_stopped', reason: String(reason || 'stopped'), ...this.status() };
@@ -606,8 +631,45 @@ export class TradeAutoManager {
   _markStageRetry(stageKey, cooldownMs) {
     if (!stageKey) return;
     this._stageInFlight.delete(stageKey);
-    this._stageRetryAfter.set(stageKey, Date.now() + Math.max(1000, Math.trunc(cooldownMs || 1000)));
-    this._trace('stage_retry', { stage: String(stageKey), cooldown_ms: Math.max(1000, Math.trunc(cooldownMs || 1000)) });
+    const ms = Math.max(250, Math.trunc(cooldownMs || 250));
+    this._stageRetryAfter.set(stageKey, Date.now() + ms);
+    this._trace('stage_retry', { stage: String(stageKey), cooldown_ms: ms });
+  }
+
+  _recordLnPayFailure({ tradeId, channel, error }) {
+    if (!tradeId || !channel) return { state: null, shouldAbort: false, elapsedMs: 0 };
+    const now = Date.now();
+    const normalizedChannel = String(channel || '').trim();
+    const prev = this._lnPayFailByTrade.get(tradeId);
+    let state;
+    if (!prev || String(prev.channel || '').trim() !== normalizedChannel) {
+      state = {
+        channel: normalizedChannel,
+        failures: 0,
+        firstFailAt: now,
+        lastFailAt: 0,
+        abortedAt: 0,
+        abortReason: '',
+        lastAbortTraceAt: 0,
+      };
+    } else {
+      state = { ...prev };
+    }
+
+    state.failures = Number(state.failures || 0) + 1;
+    state.lastFailAt = now;
+    if (!Number.isFinite(Number(state.firstFailAt)) || Number(state.firstFailAt) <= 0) state.firstFailAt = now;
+
+    const threshold = Math.max(2, Number(this.opts?.ln_pay_fail_leave_attempts || 3));
+    const minWaitMs = Math.max(1_000, Number(this.opts?.ln_pay_fail_leave_min_wait_ms || 20_000));
+    const elapsedMs = Math.max(0, now - Number(state.firstFailAt || now));
+    const shouldAbort = Number(state.failures || 0) >= threshold && elapsedMs >= minWaitMs;
+    if (shouldAbort && !Number(state.abortedAt || 0)) {
+      state.abortedAt = now;
+      state.abortReason = String(error || '').trim().slice(0, 1000);
+    }
+    this._lnPayFailByTrade.set(tradeId, state);
+    return { state, shouldAbort, elapsedMs };
   }
 
   _eventRetryKey(flow, sig) {
@@ -639,6 +701,7 @@ export class TradeAutoManager {
     this._termsReplayByTrade.delete(tradeId);
     this._swapAutoLeaveByTrade.delete(tradeId);
     this._waitingTermsState.delete(tradeId);
+    this._lnPayFailByTrade.delete(tradeId);
     const prefix = `${tradeId}:`;
     for (const key of Array.from(this._stageDone.keys())) {
       if (String(key).startsWith(prefix)) this._stageDone.delete(key);
@@ -711,6 +774,11 @@ export class TradeAutoManager {
       if (!tradeId || !Number.isFinite(lastTs) || now - lastTs > this._doneMaxAgeMs) this._waitingTermsState.delete(tradeId);
     }
     pruneMapByLimit(this._waitingTermsState, Math.max(this.opts?.max_trades || 120, this._preimageMax));
+    for (const [tradeId, state] of Array.from(this._lnPayFailByTrade.entries())) {
+      const lastTs = Number(state?.lastFailAt || state?.firstFailAt || state?.abortedAt || 0);
+      if (!tradeId || !Number.isFinite(lastTs) || now - lastTs > this._doneMaxAgeMs) this._lnPayFailByTrade.delete(tradeId);
+    }
+    pruneMapByLimit(this._lnPayFailByTrade, Math.max(this.opts?.max_trades || 120, this._preimageMax));
 
     for (const [k, seenAt] of Array.from(this._eventSeenAt.entries())) {
       if (!k || !Number.isFinite(seenAt) || now - Number(seenAt) > this._doneMaxAgeMs) this._eventSeenAt.delete(k);
@@ -738,6 +806,7 @@ export class TradeAutoManager {
   _buildContexts({ events, localPeer }) {
     const myRfqTradeIds = new Set();
     const myQuoteById = new Map();
+    const myQuoteTradeIds = new Set();
     const myOfferEvents = [];
     const quoteEvents = [];
     const acceptEvents = [];
@@ -770,7 +839,10 @@ export class TradeAutoManager {
             return `${t}:${s}:${eventTs(e)}`;
           }
         })();
-        if (local) myQuoteById.set(quoteId, { event: e, envelope: msg, channel: String(e?.channel || '').trim() });
+        if (local) {
+          myQuoteById.set(quoteId, { event: e, envelope: msg, channel: String(e?.channel || '').trim() });
+          if (tradeId) myQuoteTradeIds.add(tradeId);
+        }
         else quoteEvents.push(e);
       }
 
@@ -908,12 +980,14 @@ export class TradeAutoManager {
     return {
       myRfqTradeIds,
       myQuoteById,
+      myQuoteTradeIds,
       myOfferEvents,
       quoteEvents,
       acceptEvents,
       inviteEvents,
       swapNegotiationByTrade,
       swapTradeContexts,
+      swapTradeContextsByTrade,
       terminalTradeIds,
     };
   }
@@ -1087,6 +1161,33 @@ export class TradeAutoManager {
           const sig = envelopeSig(rfqEvt);
           if (!sig || this._autoQuotedRfqSig.has(sig)) continue;
           if (!this._canRunEvent('quote_from_offer', sig)) continue;
+          const tradeId = envelopeTradeId(rfqEvt);
+          const tradeBusy = (() => {
+            if (!tradeId) return false;
+            if (ctx.terminalTradeIds && typeof ctx.terminalTradeIds.has === 'function' && ctx.terminalTradeIds.has(tradeId)) return true;
+            if (this._autoAcceptedTradeLock.has(tradeId)) return true;
+            const neg = ctx.swapNegotiationByTrade && typeof ctx.swapNegotiationByTrade.get === 'function'
+              ? ctx.swapNegotiationByTrade.get(tradeId)
+              : null;
+            if (isObject(neg?.quote_accept) || isObject(neg?.swap_invite)) return true;
+            const swapCtx = ctx.swapTradeContextsByTrade && typeof ctx.swapTradeContextsByTrade.get === 'function'
+              ? ctx.swapTradeContextsByTrade.get(tradeId)
+              : null;
+            if (!swapCtx) return false;
+            return Boolean(
+              swapCtx.terms ||
+                swapCtx.accept ||
+                swapCtx.invoice ||
+                swapCtx.escrow ||
+                swapCtx.ln_paid ||
+                swapCtx.claimed ||
+                swapCtx.refunded ||
+                swapCtx.canceled
+            );
+          })();
+          if (tradeBusy) {
+            continue;
+          }
           const match = matchOfferForRfq({ rfqEvt, myOfferEvents: ctx.myOfferEvents });
           if (!match && this.opts.enable_quote_from_rfqs !== true) continue;
           const refundWindowSec =
@@ -1318,7 +1419,10 @@ export class TradeAutoManager {
           const takerSigner = String(acceptEnv?.signer || quoteAcceptEnv?.signer || rfqEnv?.signer || '').trim().toLowerCase();
           const inviteePeer = String(neg?.swap_invite?.body?.invite?.payload?.inviteePubKey || '').trim().toLowerCase();
           const iAmInvitedTaker = Boolean(localPeer && /^[0-9a-f]{64}$/i.test(inviteePeer) && inviteePeer === localPeer);
-          const iAmMaker = Boolean(localPeer && makerSigner && makerSigner === localPeer);
+          const iAmMaker = Boolean(
+            (localPeer && makerSigner && makerSigner === localPeer) ||
+              (ctx.myQuoteTradeIds && typeof ctx.myQuoteTradeIds.has === 'function' && ctx.myQuoteTradeIds.has(tradeId))
+          );
           const iAmTaker = Boolean(
             (localPeer && takerSigner && takerSigner === localPeer) ||
               iAmInvitedTaker ||
@@ -1546,6 +1650,26 @@ export class TradeAutoManager {
               let pingOk = 0;
               const pingErrors = [];
               try {
+                const inviteForAuth =
+                  isObject(neg?.swap_invite?.body?.invite)
+                    ? neg.swap_invite.body.invite
+                    : null;
+                if (inviteForAuth) {
+                  try {
+                    await this._runToolWithTimeout(
+                      { tool: 'intercomswap_sc_send_json', args: { channel: swapChannel, json: { control: 'auth', invite: inviteForAuth } } },
+                      { timeoutMs: Math.min(this._toolTimeoutMs, 10_000), label: 'tradeauto_waiting_terms_auth_ping' }
+                    );
+                    pingOk += 1;
+                    this._trace('waiting_terms_auth_ping_ok', {
+                      trade_id: tradeId,
+                      channel: swapChannel,
+                      attempt: Number(state.pings || 0) + 1,
+                    });
+                  } catch (err) {
+                    pingErrors.push(`auth:${err?.message || String(err)}`);
+                  }
+                }
                 if (isObject(quoteAcceptEnv)) {
                   const replayChannel =
                     String(neg?.quote_accept_channel || '').trim() ||
@@ -1732,6 +1856,23 @@ export class TradeAutoManager {
 
           if (iAmTaker && termsEnv && invoiceEnv && escrowEnv && !lnPaidEnv) {
             const stageKey = `${tradeId}:ln_pay`;
+            const lnPayFailState = this._lnPayFailByTrade.get(tradeId) || null;
+            if (lnPayFailState && Number(lnPayFailState.abortedAt || 0) > 0) {
+              const traceCd = Math.max(1_000, Math.trunc(Number(this.opts?.waiting_terms_trace_cooldown_ms || 15_000)));
+              const nowMs = Date.now();
+              if (!Number(lnPayFailState.lastAbortTraceAt || 0) || nowMs - Number(lnPayFailState.lastAbortTraceAt || 0) >= traceCd) {
+                lnPayFailState.lastAbortTraceAt = nowMs;
+                this._lnPayFailByTrade.set(tradeId, lnPayFailState);
+                this._trace('ln_pay_aborted', {
+                  trade_id: tradeId,
+                  channel: swapChannel,
+                  failures: Number(lnPayFailState.failures || 0),
+                  aborted_at: Number(lnPayFailState.abortedAt || 0),
+                  reason: String(lnPayFailState.abortReason || '').slice(0, 1000),
+                });
+              }
+              continue;
+            }
             if (this._canRunStage(stageKey)) {
               this._markStageInFlight(stageKey);
               try {
@@ -1748,13 +1889,59 @@ export class TradeAutoManager {
                 });
                 const preimageHex = String(out?.preimage_hex || '').trim().toLowerCase();
                 if (/^[0-9a-f]{64}$/i.test(preimageHex)) this._tradePreimage.set(tradeId, preimageHex);
+                this._lnPayFailByTrade.delete(tradeId);
                 this._pruneCaches();
                 this._markStageSuccess(stageKey);
                 actionsLeft -= 1;
                 this._stats.actions += 1;
               } catch (err) {
-                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: err?.message || String(err) });
-                this._markStageRetry(stageKey, 10_000);
+                const errMsg = err?.message || String(err);
+                this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: errMsg });
+                const failRec = this._recordLnPayFailure({
+                  tradeId,
+                  channel: swapChannel,
+                  error: errMsg,
+                });
+                const failState = failRec?.state || null;
+                const elapsedMs = Math.max(0, Math.trunc(Number(failRec?.elapsedMs || 0)));
+                if (failRec?.shouldAbort && failState) {
+                  const leaveStageKey = `${tradeId}:ln_pay_fail_leave`;
+                  this._markStageSuccess(stageKey);
+                  this._trace('ln_pay_fail_threshold_reached', {
+                    trade_id: tradeId,
+                    channel: swapChannel,
+                    failures: Number(failState.failures || 0),
+                    elapsed_ms: elapsedMs,
+                    min_wait_ms: Math.max(1_000, Number(this.opts?.ln_pay_fail_leave_min_wait_ms || 20_000)),
+                    threshold_attempts: Math.max(2, Number(this.opts?.ln_pay_fail_leave_attempts || 3)),
+                  });
+                  if (this._canRunStage(leaveStageKey)) {
+                    this._markStageInFlight(leaveStageKey);
+                    try {
+                      await this._runToolWithTimeout(
+                        { tool: 'intercomswap_sc_leave', args: { channel: swapChannel } },
+                        { timeoutMs: Math.min(this._toolTimeoutMs, 10_000), label: 'ln_pay_fail_leave' }
+                      );
+                      this._markStageSuccess(leaveStageKey);
+                      this._trace('ln_pay_fail_leave_ok', {
+                        trade_id: tradeId,
+                        channel: swapChannel,
+                        failures: Number(failState.failures || 0),
+                        elapsed_ms: elapsedMs,
+                      });
+                    } catch (leaveErr) {
+                      this._markStageRetry(leaveStageKey, Math.max(1_000, Number(this.opts?.swap_auto_leave_cooldown_ms || 10_000)));
+                      this._trace('ln_pay_fail_leave_error', {
+                        trade_id: tradeId,
+                        channel: swapChannel,
+                        error: leaveErr?.message || String(leaveErr),
+                      });
+                    }
+                  }
+                } else {
+                  const retryMs = Math.max(250, Number(this.opts?.ln_pay_retry_cooldown_ms || 10_000));
+                  this._markStageRetry(stageKey, retryMs);
+                }
                 this._log(`[tradeauto] ${stageKey} failed: ${err?.message || String(err)}`);
               }
             }

@@ -393,7 +393,7 @@ export async function lnCloseChannel(opts, { channelId, force = false, satPerVby
   return lnClnCli({ ...opts, args: ['close', id] });
 }
 
-export async function lnInvoice(opts, { amountMsat, label, description, expirySec = null }) {
+export async function lnInvoice(opts, { amountMsat, label, description, expirySec = null, privateRouteHints = false }) {
   const desc = String(description || '').trim();
   if (!desc) throw new Error('Missing invoice description');
 
@@ -401,12 +401,48 @@ export async function lnInvoice(opts, { amountMsat, label, description, expirySe
     const memo = String(label || '').trim() ? `${String(label).trim()} ${desc}`.trim() : desc;
     const amt = BigInt(String(amountMsat));
     if (amt <= 0n) throw new Error('Invalid amountMsat');
-    const args = ['addinvoice', '--amt_msat', String(amt), '--memo', memo];
-    if (expirySec !== null && expirySec !== undefined) {
-      const exp = Number(expirySec);
-      if (Number.isFinite(exp) && exp > 0) args.push('--expiry', String(exp));
+    const invCfg = {
+      privateEnabled: privateRouteHints === true,
+      privateFlag: '--private',
+    };
+    const buildArgs = () => {
+      const args = ['addinvoice', '--amt_msat', String(amt), '--memo', memo];
+      if (expirySec !== null && expirySec !== undefined) {
+        const exp = Number(expirySec);
+        if (Number.isFinite(exp) && exp > 0) args.push('--expiry', String(exp));
+      }
+      if (invCfg.privateEnabled && invCfg.privateFlag) args.push(invCfg.privateFlag);
+      return args;
+    };
+
+    let r;
+    let lastErr = null;
+    for (let i = 0; i < 6; i += 1) {
+      try {
+        r = await lnLndCli({ ...opts, args: buildArgs() });
+        break;
+      } catch (err) {
+        lastErr = err;
+        const privateFlag = String(invCfg.privateFlag || '').trim();
+        if (invCfg.privateEnabled && privateFlag && isUnknownFlagError(err, privateFlag)) {
+          if (privateFlag === '--private') {
+            invCfg.privateFlag = '--private_only';
+            continue;
+          }
+          invCfg.privateEnabled = false;
+          invCfg.privateFlag = '';
+          continue;
+        }
+        const unknownAny = /flag provided but not defined|unknown flag/i.test(String(err?.message || ''));
+        if (invCfg.privateEnabled && unknownAny) {
+          invCfg.privateEnabled = false;
+          invCfg.privateFlag = '';
+          continue;
+        }
+        throw err;
+      }
     }
-    const r = await lnLndCli({ ...opts, args });
+    if (!r) throw lastErr || new Error('LND addinvoice failed');
 
     const bolt11 = String(r?.payment_request || r?.paymentRequest || '').trim();
     if (!bolt11) throw new Error('LND addinvoice missing payment_request');
