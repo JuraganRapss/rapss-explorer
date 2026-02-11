@@ -199,6 +199,9 @@ export class TradeAutoManager {
     this._notOwnerTraceAt = new Map(); // trade_id -> ts
     this._termsReplayByTrade = new Map(); // trade_id -> { count, nextAtMs, lastTs }
     this._swapAutoLeaveByTrade = new Map(); // trade_id -> { attempts, nextAtMs, lastTs }
+    this._cachedLocalPeer = '';
+    this._cachedLocalSolSigner = '';
+    this._waitingTermsTraceAt = new Map(); // trade_id -> ts
 
     this._stats = {
       ticks: 0,
@@ -266,6 +269,7 @@ export class TradeAutoManager {
         not_owner_trace_at: this._notOwnerTraceAt.size,
         terms_replay_by_trade: this._termsReplayByTrade.size,
         swap_auto_leave_by_trade: this._swapAutoLeaveByTrade.size,
+        waiting_terms_trace_at: this._waitingTermsTraceAt.size,
         debug_events: this._debugEvents.length,
       },
       recent_events: this._debugEvents.slice(-Math.min(200, this._debugMax)),
@@ -419,6 +423,9 @@ export class TradeAutoManager {
     this._notOwnerTraceAt.clear();
     this._termsReplayByTrade.clear();
     this._swapAutoLeaveByTrade.clear();
+    this._cachedLocalPeer = '';
+    this._cachedLocalSolSigner = '';
+    this._waitingTermsTraceAt.clear();
 
     this._stats = {
       ticks: 0,
@@ -479,6 +486,9 @@ export class TradeAutoManager {
     this._notOwnerTraceAt.clear();
     this._termsReplayByTrade.clear();
     this._swapAutoLeaveByTrade.clear();
+    this._cachedLocalPeer = '';
+    this._cachedLocalSolSigner = '';
+    this._waitingTermsTraceAt.clear();
     this._trace('tradeauto_stop', { reason: String(reason || 'stopped') });
     return { type: 'tradeauto_stopped', reason: String(reason || 'stopped'), ...this.status() };
   }
@@ -539,6 +549,7 @@ export class TradeAutoManager {
     this._tradePreimage.delete(tradeId);
     this._termsReplayByTrade.delete(tradeId);
     this._swapAutoLeaveByTrade.delete(tradeId);
+    this._waitingTermsTraceAt.delete(tradeId);
     const prefix = `${tradeId}:`;
     for (const key of Array.from(this._stageDone.keys())) {
       if (String(key).startsWith(prefix)) this._stageDone.delete(key);
@@ -606,6 +617,10 @@ export class TradeAutoManager {
       if (!tradeId || !Number.isFinite(lastTs) || now - lastTs > this._doneMaxAgeMs) this._swapAutoLeaveByTrade.delete(tradeId);
     }
     pruneMapByLimit(this._swapAutoLeaveByTrade, Math.max(this.opts?.max_trades || 120, this._preimageMax));
+    for (const [tradeId, ts] of Array.from(this._waitingTermsTraceAt.entries())) {
+      if (!Number.isFinite(ts) || now - Number(ts) > this._doneMaxAgeMs) this._waitingTermsTraceAt.delete(tradeId);
+    }
+    pruneMapByLimit(this._waitingTermsTraceAt, Math.max(this.opts?.max_trades || 120, this._preimageMax));
   }
 
   _appendEvents(events) {
@@ -883,22 +898,42 @@ export class TradeAutoManager {
       }
       this._lastSeq = Number.isFinite(read.latest_seq) ? Math.max(this._lastSeq, Math.trunc(read.latest_seq)) : this._lastSeq;
 
-      const localPeer = String(
-        (await this._runToolWithTimeout(
-          { tool: 'intercomswap_sc_info', args: {} },
-          { timeoutMs: Math.min(this._toolTimeoutMs, 8_000), label: 'tradeauto_sc_info' }
-        ))?.peer || ''
-      )
-        .trim()
-        .toLowerCase();
-      const localSolSigner = String(
-        (
-          await this._runToolWithTimeout(
-            { tool: 'intercomswap_sol_signer_pubkey', args: {} },
-            { timeoutMs: Math.min(this._toolTimeoutMs, 8_000), label: 'tradeauto_sol_signer' }
-          )
-        )?.pubkey || ''
-      ).trim();
+      let localPeer = '';
+      try {
+        localPeer = String(
+          (await this._runToolWithTimeout(
+            { tool: 'intercomswap_sc_info', args: {} },
+            { timeoutMs: Math.min(this._toolTimeoutMs, 8_000), label: 'tradeauto_sc_info' }
+          ))?.peer || ''
+        )
+          .trim()
+          .toLowerCase();
+        if (localPeer) this._cachedLocalPeer = localPeer;
+      } catch (err) {
+        localPeer = String(this._cachedLocalPeer || '').trim().toLowerCase();
+        this._trace('sc_info_warn', {
+          fallback_cached: Boolean(localPeer),
+          error: err?.message || String(err),
+        });
+      }
+      let localSolSigner = '';
+      try {
+        localSolSigner = String(
+          (
+            await this._runToolWithTimeout(
+              { tool: 'intercomswap_sol_signer_pubkey', args: {} },
+              { timeoutMs: Math.min(this._toolTimeoutMs, 8_000), label: 'tradeauto_sol_signer' }
+            )
+          )?.pubkey || ''
+        ).trim();
+        if (localSolSigner) this._cachedLocalSolSigner = localSolSigner;
+      } catch (err) {
+        localSolSigner = String(this._cachedLocalSolSigner || '').trim();
+        this._trace('sol_signer_warn', {
+          fallback_cached: Boolean(localSolSigner),
+          error: err?.message || String(err),
+        });
+      }
 
       const activeEvents = this._events.filter((e) => !isEventStale(e, this.opts.event_max_age_ms));
       const ctx = this._buildContexts({ events: activeEvents, localPeer });
@@ -1286,6 +1321,21 @@ export class TradeAutoManager {
                 attempt: attempts,
                 error: err?.message || String(err),
               });
+            }
+            continue;
+          }
+
+          if (iAmTaker && !termsEnv) {
+            const last = Number(this._waitingTermsTraceAt.get(tradeId) || 0);
+            if (Date.now() - last > 15_000) {
+              this._trace('waiting_terms', {
+                trade_id: tradeId,
+                channel: swapChannel,
+                has_invite: Boolean(isObject(neg?.swap_invite)),
+                has_quote_accept: Boolean(isObject(quoteAcceptEnv)),
+                has_rfq: Boolean(isObject(rfqEnv)),
+              });
+              this._waitingTermsTraceAt.set(tradeId, Date.now());
             }
             continue;
           }
