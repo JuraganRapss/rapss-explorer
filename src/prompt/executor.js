@@ -1372,42 +1372,77 @@ export class ToolExecutor {
         };
       }
 
-      const { peerStatus, peerStart } = await import('../peer/peerManager.js');
-      const status = peerStatus({ repoRoot: process.cwd(), name: '' });
-      const aliveMatch =
-        Array.isArray(status?.peers) ? status.peers.find((p) => p?.alive && Number(p?.sc_bridge?.port) === scPort) : null;
-
       let peerOut = null;
       let peerName = peerNameArg || '';
       let peerStore = peerStoreArg || '';
+      let peerStoreSource = peerStore ? 'arg' : '';
 
-      if (aliveMatch) {
-        peerName = String(aliveMatch?.name || '').trim();
-        peerStore = String(aliveMatch?.store || '').trim();
-        peerOut = { type: 'peer_already_running', name: peerName, store: peerStore, pid: aliveMatch.pid || null, log: aliveMatch.log || null };
-      } else {
-        // Heuristic defaults:
-        // 1) Prefer store inferred from the configured peer.keypair path (if it points into stores/<store>/db/keypair.json).
-        if (!peerStore) {
+      // Heuristic defaults:
+      // 1) Prefer store inferred from the configured peer.keypair path (if it points into stores/<store>/db/keypair.json).
+      if (!peerStore) {
+        try {
+          const kp = String(this.peer?.keypairPath || '').trim();
+          const m = kp.match(/[\\/]+stores[\\/]+([^\\/]+)[\\/]+db[\\/]+keypair\\.json$/i);
+          const inferred = m ? String(m[1] || '').trim() : '';
+          if (inferred && /^[A-Za-z0-9._-]+$/.test(inferred)) {
+            peerStore = inferred;
+            peerStoreSource = 'peer_keypair';
+          }
+        } catch (_e) {}
+      }
+
+      // Heuristic defaults: derive store from receipts db basename if possible.
+      if (!peerStore) {
+        try {
+          const receiptsDb = String(this.receipts?.dbPath || '').trim();
+          const base = receiptsDb ? path.basename(receiptsDb).replace(/\.(sqlite|db)$/i, '') : '';
+          if (base && /^[A-Za-z0-9._-]+$/.test(base)) {
+            peerStore = base;
+            peerStoreSource = 'receipts_db';
+          }
+        } catch (_e) {}
+      }
+      if (!peerStore) {
+        peerStore = 'swap-maker';
+        peerStoreSource = 'default';
+      }
+      if (!peerName) peerName = `${peerStore}-peer`;
+
+      const { peerStatus, peerStart, peerStop } = await import('../peer/peerManager.js');
+      const status = peerStatus({ repoRoot: process.cwd(), name: '' });
+      const peers = Array.isArray(status?.peers) ? status.peers : [];
+      const aliveByName = peers.find((p) => p?.alive && String(p?.name || '').trim() === peerName) || null;
+      const aliveByStore = peers.find((p) => p?.alive && String(p?.store || '').trim() === peerStore) || null;
+      const targetAlive = aliveByName || aliveByStore || null;
+      let aliveOnPort = peers.find((p) => p?.alive && Number(p?.sc_bridge?.port) === scPort) || null;
+
+      if (targetAlive) {
+        peerName = String(targetAlive?.name || '').trim() || peerName;
+        peerStore = String(targetAlive?.store || '').trim() || peerStore;
+        peerOut = { type: 'peer_already_running', name: peerName, store: peerStore, pid: targetAlive.pid || null, log: targetAlive.log || null };
+      } else if (aliveOnPort) {
+        const occName = String(aliveOnPort?.name || '').trim();
+        const occStore = String(aliveOnPort?.store || '').trim();
+        const mismatch = (peerName && occName !== peerName) || (peerStore && occStore !== peerStore);
+        const strictSource = peerStoreSource === 'arg' || peerStoreSource === 'peer_keypair';
+
+        if (mismatch && strictSource) {
           try {
-            const kp = String(this.peer?.keypairPath || '').trim();
-            const m = kp.match(/[\\/]+stores[\\/]+([^\\/]+)[\\/]+db[\\/]+keypair\\.json$/i);
-            const inferred = m ? String(m[1] || '').trim() : '';
-            if (inferred && /^[A-Za-z0-9._-]+$/.test(inferred)) peerStore = inferred;
-          } catch (_e) {}
+            await peerStop({ repoRoot: process.cwd(), name: occName, signal: 'SIGTERM', waitMs: 5000 });
+            aliveOnPort = null;
+          } catch (err) {
+            throw new Error(
+              `${toolName}: sc_port ${scPort} is occupied by ${occName || 'unknown'} (${occStore || 'unknown'}); failed to stop occupant: ${err?.message || String(err)}`
+            );
+          }
+        } else {
+          peerName = occName || peerName;
+          peerStore = occStore || peerStore;
+          peerOut = { type: 'peer_already_running', name: peerName, store: peerStore, pid: aliveOnPort.pid || null, log: aliveOnPort.log || null };
         }
+      }
 
-        // Heuristic defaults: derive store from receipts db basename if possible.
-        if (!peerStore) {
-          try {
-            const receiptsDb = String(this.receipts?.dbPath || '').trim();
-            const base = receiptsDb ? path.basename(receiptsDb).replace(/\.(sqlite|db)$/i, '') : '';
-            if (base && /^[A-Za-z0-9._-]+$/.test(base)) peerStore = base;
-          } catch (_e) {}
-        }
-        if (!peerStore) peerStore = 'swap-maker';
-        if (!peerName) peerName = `${peerStore}-peer`;
-
+      if (!peerOut) {
         // If no sidechannels provided, use a sane default rendezvous.
         const peerSidechannels = sidechannels.length > 0 ? sidechannels : ['0000intercomswapbtcusdt'];
 
@@ -1443,10 +1478,9 @@ export class ToolExecutor {
       this._peerSigning = null;
 
       let keypairOk = await waitForFile(inferredKeypair, { timeoutMs: 15_000 });
-      if (!keypairOk && aliveMatch) {
+      if (!keypairOk && targetAlive) {
         // If the peer was already running but the keypair file is missing, restart it so index.js
         // can regenerate/export the keypair file.
-        const { peerStop } = await import('../peer/peerManager.js');
         try {
           await peerStop({ repoRoot: process.cwd(), name: peerName, signal: 'SIGTERM', waitMs: 4000 });
         } catch (_e) {}
@@ -1455,18 +1489,18 @@ export class ToolExecutor {
           name: peerName,
           store: peerStore,
           scPort,
-          sidechannels: sidechannels.length > 0 ? sidechannels : Array.isArray(aliveMatch?.args?.sidechannels) ? aliveMatch.args.sidechannels : ['0000intercomswapbtcusdt'],
-          sidechannelInviterKeys: Array.isArray(aliveMatch?.args?.sidechannel_inviter_keys) ? aliveMatch.args.sidechannel_inviter_keys : [],
-          dhtBootstrap: Array.isArray(aliveMatch?.args?.dht_bootstrap) ? aliveMatch.args.dht_bootstrap : [],
-          msbDhtBootstrap: Array.isArray(aliveMatch?.args?.msb_dht_bootstrap) ? aliveMatch.args.msb_dht_bootstrap : [],
-          subnetChannel: String(aliveMatch?.args?.subnet_channel || '').trim(),
-          msbEnabled: Boolean(aliveMatch?.args?.msb),
-          priceOracleEnabled: Boolean(aliveMatch?.args?.price_oracle),
-          sidechannelPowEnabled: Boolean(aliveMatch?.args?.sidechannel_pow),
-          sidechannelPowDifficulty: Number.isInteger(aliveMatch?.args?.sidechannel_pow_difficulty) ? aliveMatch.args.sidechannel_pow_difficulty : 12,
-          sidechannelWelcomeRequired: Boolean(aliveMatch?.args?.sidechannel_welcome_required),
-          sidechannelInviteRequired: Boolean(aliveMatch?.args?.sidechannel_invite_required),
-          sidechannelInvitePrefixes: Array.isArray(aliveMatch?.args?.sidechannel_invite_prefixes) ? aliveMatch.args.sidechannel_invite_prefixes : ['swap:'],
+          sidechannels: sidechannels.length > 0 ? sidechannels : Array.isArray(targetAlive?.args?.sidechannels) ? targetAlive.args.sidechannels : ['0000intercomswapbtcusdt'],
+          sidechannelInviterKeys: Array.isArray(targetAlive?.args?.sidechannel_inviter_keys) ? targetAlive.args.sidechannel_inviter_keys : [],
+          dhtBootstrap: Array.isArray(targetAlive?.args?.dht_bootstrap) ? targetAlive.args.dht_bootstrap : [],
+          msbDhtBootstrap: Array.isArray(targetAlive?.args?.msb_dht_bootstrap) ? targetAlive.args.msb_dht_bootstrap : [],
+          subnetChannel: String(targetAlive?.args?.subnet_channel || '').trim(),
+          msbEnabled: Boolean(targetAlive?.args?.msb),
+          priceOracleEnabled: Boolean(targetAlive?.args?.price_oracle),
+          sidechannelPowEnabled: Boolean(targetAlive?.args?.sidechannel_pow),
+          sidechannelPowDifficulty: Number.isInteger(targetAlive?.args?.sidechannel_pow_difficulty) ? targetAlive.args.sidechannel_pow_difficulty : 12,
+          sidechannelWelcomeRequired: Boolean(targetAlive?.args?.sidechannel_welcome_required),
+          sidechannelInviteRequired: Boolean(targetAlive?.args?.sidechannel_invite_required),
+          sidechannelInvitePrefixes: Array.isArray(targetAlive?.args?.sidechannel_invite_prefixes) ? targetAlive.args.sidechannel_invite_prefixes : ['swap:'],
           logPath: '',
           readyTimeoutMs: 60_000,
         });
