@@ -534,6 +534,16 @@
   border-color: rgba(124, 58, 237, 0.36);
   box-shadow: 0 0 0 1px rgba(124, 58, 237, 0.14);
 }
+.rowitem.expired {
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(15, 23, 42, 0.32);
+  color: #93a0b3;
+}
+.rowitem.expired .mono,
+.rowitem.expired .dim,
+.rowitem.expired .muted {
+  color: #8c97aa;
+}
 .rowitem-top {
   display: flex;
   align-items: center;

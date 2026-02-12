@@ -6,6 +6,9 @@ import {
   chatClear,
   chatListBefore,
   chatListLatest,
+  COLLINS_ACTIVITY_RETENTION_MS,
+  COLLINS_SC_FEED_RETENTION_MS,
+  dbPruneRetention,
   promptAdd,
   promptListBefore,
   promptListLatest,
@@ -21,6 +24,8 @@ const MAINNET_USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 const SOL_TX_FEE_BUFFER_LAMPORTS = 50_000; // best-effort guardrail for claim/refund/transfer tx fees
 const LN_ROUTE_FEE_BUFFER_MIN_SATS = 50;
 const LN_ROUTE_FEE_BUFFER_BPS = 10; // 0.10%
+const MS_PER_HOUR = 60 * 60 * 1000;
+const SWAP_WATCH_RETENTION_MS = 2 * MS_PER_HOUR;
 
 type LnPeerSuggestion = { id: string; addr: string; uri: string; connected: boolean };
 
@@ -212,6 +217,17 @@ function deriveScEventDedupKey(evt: any): string {
   return `evt:${channel}:${kind}:${tradeId}:${ts}`;
 }
 
+function eventTsMs(evt: any): number {
+  if (!evt || typeof evt !== 'object') return 0;
+  const directTs = typeof (evt as any).ts === 'number' ? (evt as any).ts : null;
+  if (directTs !== null && Number.isFinite(directTs) && directTs > 0) return Math.trunc(directTs);
+  const startedAt = typeof (evt as any).started_at === 'number' ? (evt as any).started_at : null;
+  if (startedAt !== null && Number.isFinite(startedAt) && startedAt > 0) return Math.trunc(startedAt);
+  const msgTs = typeof (evt as any)?.message?.ts === 'number' ? (evt as any).message.ts : null;
+  if (msgTs !== null && Number.isFinite(msgTs) && msgTs > 0) return Math.trunc(msgTs);
+  return 0;
+}
+
 const SC_UI_KIND_ALLOWLIST = new Set<string>([
   'swap.rfq',
   'swap.svc_announce',
@@ -314,6 +330,7 @@ function App() {
   const [scStreamErr, setScStreamErr] = useState<string | null>(null);
   const [scChannels, setScChannels] = useState<string>('0000intercomswapbtcusdt');
   const [scSwapWatchChannels, setScSwapWatchChannelsState] = useState<string[]>([]);
+  const scSwapWatchFirstSeenAtRef = useRef<Map<string, number>>(new Map());
   const [scFilter, setScFilter] = useState<{ channel: string; kind: string }>({ channel: '', kind: '' });
   const [showExpiredInvites, setShowExpiredInvites] = useState<boolean>(() => {
     try {
@@ -391,13 +408,7 @@ function App() {
 
   const [preflight, setPreflight] = useState<any>(null);
   const [preflightBusy, setPreflightBusy] = useState(false);
-  const [tradeAutoTraceEnabled, setTradeAutoTraceEnabled] = useState<boolean>(() => {
-    try {
-      return String(window.localStorage.getItem('collin_tradeauto_trace_enabled') || '') === '1';
-    } catch (_e) {
-      return false;
-    }
-  });
+  const [tradeAutoTraceEnabled, setTradeAutoTraceEnabled] = useState<boolean>(false);
   const [envInfo, setEnvInfo] = useState<any>(null);
   const [envBusy, setEnvBusy] = useState(false);
   const [envErr, setEnvErr] = useState<string | null>(null);
@@ -538,12 +549,6 @@ function App() {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem('collin_tradeauto_trace_enabled', tradeAutoTraceEnabled ? '1' : '0');
-    } catch (_e) {}
-  }, [tradeAutoTraceEnabled]);
-
-  useEffect(() => {
-    try {
       window.localStorage.setItem('collin_dismissed_invites', JSON.stringify(dismissedInviteTradeIds || {}));
     } catch (_e) {}
   }, [dismissedInviteTradeIds]);
@@ -574,7 +579,6 @@ function App() {
     }
   });
   const [lnChannelAmountSats, setLnChannelAmountSats] = useState<number>(1_000_000);
-  const [lnChannelPrivate, setLnChannelPrivate] = useState<boolean>(true);
   const [lnChannelSatPerVbyte, setLnChannelSatPerVbyte] = useState<number>(2);
   const [lnChannelCloseSatPerVbyte, setLnChannelCloseSatPerVbyte] = useState<number>(2);
   const [lnSpliceChannelId, setLnSpliceChannelId] = useState<string>('');
@@ -658,7 +662,7 @@ function App() {
 
   // Stack observer: lightweight operator signal when a previously-ready stack degrades.
   const stackOkRef = useRef<boolean | null>(null);
-  const [stackLastOkTs, setStackLastOkTs] = useState<number | null>(null);
+  const [, setStackLastOkTs] = useState<number | null>(null);
 
   // Sell USDT: offer announcer (non-binding discovery message).
   type OfferLine = { id: string; btc_sats: number; usdt_amount: string };
@@ -1280,6 +1284,16 @@ function App() {
     return Array.from(set).sort();
   }, [scEvents, rendezvousChannels, scSwapWatchChannels, preflight?.sc_stats]);
   const knownChannelsForInputs = useMemo(() => knownChannels.slice(0, 500), [knownChannels]);
+  const knownRendezvousChannelsForInputs = useMemo(
+    () => knownChannelsForInputs.filter((c) => !isSwapTradeChannelName(c)),
+    [knownChannelsForInputs]
+  );
+
+  useEffect(() => {
+    if (!isSwapTradeChannelName(rfqChannel)) return;
+    const next = knownRendezvousChannelsForInputs[0] || rendezvousChannels[0] || '0000intercomswapbtcusdt';
+    if (next !== rfqChannel) setRfqChannel(next);
+  }, [rfqChannel, knownRendezvousChannelsForInputs, rendezvousChannels]);
 
   const lnWalletLocked = useMemo(() => {
     const errs = [
@@ -1375,6 +1389,14 @@ function App() {
     const uniq = normalizeChannels(next.map((s) => String(s || '').trim()).filter(Boolean), { max: 50, dropSwapTradeChannels: false }).filter((c) =>
       isSwapTradeChannelName(c)
     );
+    const now = Date.now();
+    const prevSeen = scSwapWatchFirstSeenAtRef.current;
+    const nextSeen = new Map<string, number>();
+    for (const c of uniq) {
+      const seenAt = Number(prevSeen.get(c) || 0);
+      nextSeen.set(c, seenAt > 0 ? seenAt : now);
+    }
+    scSwapWatchFirstSeenAtRef.current = nextSeen;
     setScSwapWatchChannelsState(uniq);
   }
 
@@ -1420,6 +1442,23 @@ function App() {
     setTimeout(() => void startScStream(), 150);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [health?.ok, joinedChannels, watchedChannelsSet, scSwapWatchChannels]);
+
+  // Invite/swap watch hygiene: drop swap:* watch channels once first seen age exceeds 2h.
+  useEffect(() => {
+    if (!Array.isArray(scSwapWatchChannels) || scSwapWatchChannels.length < 1) return;
+    const now = uiNowMs;
+    const keep: string[] = [];
+    const firstSeen = scSwapWatchFirstSeenAtRef.current;
+    for (const ch of scSwapWatchChannels) {
+      const seenAt = Number(firstSeen.get(ch) || 0);
+      if (seenAt > 0 && now - seenAt > SWAP_WATCH_RETENTION_MS) continue;
+      keep.push(ch);
+    }
+    if (keep.length === scSwapWatchChannels.length) return;
+    setSwapWatchChannels(keep);
+    setTimeout(() => void startScStream(), 150);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uiNowMs, scSwapWatchChannels]);
 
   async function acceptQuoteEnvelope(quoteEvt: any, opts: { origin: 'manual' }) {
     const channel = String((quoteEvt as any)?.channel || '').trim();
@@ -1558,14 +1597,14 @@ function App() {
 
   const sellUsdtFeedItems = useMemo(() => {
     const out: any[] = [];
-    out.push({ _t: 'header', id: 'h:inboxrfqs', title: 'RFQ Inbox', count: rfqEvents.length, open: sellUsdtInboxOpen, onToggle: () => toggleSellUsdtSection('inbox') });
+    out.push({ _t: 'header', id: 'h:inboxrfqs', title: 'BTC Sales', count: rfqEvents.length, open: sellUsdtInboxOpen, onToggle: () => toggleSellUsdtSection('inbox') });
     if (sellUsdtInboxOpen) {
       for (let i = 0; i < rfqEvents.length; i += 1) {
         const e = rfqEvents[i];
         out.push({ _t: 'rfq', id: feedEventId('inrfq:', e, i), evt: e });
       }
     }
-    out.push({ _t: 'header', id: 'h:myoffers', title: 'My Offers', count: myOfferPosts.length, open: sellUsdtMyOpen, onToggle: () => toggleSellUsdtSection('mine') });
+    out.push({ _t: 'header', id: 'h:myoffers', title: 'My USDT Sales', count: myOfferPosts.length, open: sellUsdtMyOpen, onToggle: () => toggleSellUsdtSection('mine') });
     if (sellUsdtMyOpen) {
       for (let i = 0; i < myOfferPosts.length; i += 1) {
         const e = myOfferPosts[i];
@@ -1577,21 +1616,21 @@ function App() {
 
   const sellBtcFeedItems = useMemo(() => {
     const out: any[] = [];
-    out.push({ _t: 'header', id: 'h:inboxoffers', title: 'Offer Inbox', count: offerEvents.length, open: sellBtcInboxOpen, onToggle: () => toggleSellBtcSection('offers') });
+    out.push({ _t: 'header', id: 'h:inboxoffers', title: 'USDT Sales', count: offerEvents.length, open: sellBtcInboxOpen, onToggle: () => toggleSellBtcSection('offers') });
     if (sellBtcInboxOpen) {
       for (let i = 0; i < offerEvents.length; i += 1) {
         const e = offerEvents[i];
         out.push({ _t: 'offer', id: feedEventId('inoffer:', e, i), evt: e });
       }
     }
-    out.push({ _t: 'header', id: 'h:inboxquotes', title: 'Quote Inbox', count: quoteEvents.length, open: sellBtcQuotesOpen, onToggle: () => toggleSellBtcSection('quotes') });
+    out.push({ _t: 'header', id: 'h:inboxquotes', title: 'Exact Matches', count: quoteEvents.length, open: sellBtcQuotesOpen, onToggle: () => toggleSellBtcSection('quotes') });
     if (sellBtcQuotesOpen) {
       for (let i = 0; i < quoteEvents.length; i += 1) {
         const e = quoteEvents[i];
         out.push({ _t: 'quote', id: feedEventId('inq:', e, i), evt: e });
       }
     }
-    out.push({ _t: 'header', id: 'h:myrfqs', title: 'My RFQs', count: myRfqPosts.length, open: sellBtcMyOpen, onToggle: () => toggleSellBtcSection('mine') });
+    out.push({ _t: 'header', id: 'h:myrfqs', title: 'My BTC Sales', count: myRfqPosts.length, open: sellBtcMyOpen, onToggle: () => toggleSellBtcSection('mine') });
     if (sellBtcMyOpen) {
       for (let i = 0; i < myRfqPosts.length; i += 1) {
         const e = myRfqPosts[i];
@@ -1618,7 +1657,14 @@ function App() {
     try {
       const older = await scListBefore({ beforeId, limit });
       if (!older || older.length === 0) return;
-      const mapped = older.map((r) => ({ ...(r.evt || {}), db_id: r.id }));
+      const cutoff = Date.now() - COLLINS_SC_FEED_RETENTION_MS;
+      const mapped = older
+        .map((r) => ({ ...(r.evt || {}), db_id: r.id }))
+        .filter((e) => {
+          const ts = eventTsMs(e);
+          return ts <= 0 || ts >= cutoff;
+        });
+      if (mapped.length < 1) return;
       setScEvents((prev) => {
         const seen = new Set(prev.map((e) => e?.db_id).filter((n) => typeof n === 'number'));
         const toAdd = mapped.filter((e) => typeof e?.db_id === 'number' && !seen.has(e.db_id));
@@ -1640,7 +1686,14 @@ function App() {
     try {
       const older = await promptListBefore({ beforeId, limit });
       if (!older || older.length === 0) return;
-      const mapped = older.map((r) => ({ ...(r.evt || {}), db_id: r.id }));
+      const cutoff = Date.now() - COLLINS_ACTIVITY_RETENTION_MS;
+      const mapped = older
+        .map((r) => ({ ...(r.evt || {}), db_id: r.id }))
+        .filter((e) => {
+          const ts = eventTsMs(e);
+          return ts <= 0 || ts >= cutoff;
+        });
+      if (mapped.length < 1) return;
       setPromptEvents((prev) => {
         const seen = new Set(prev.map((e) => e?.db_id).filter((n) => typeof n === 'number'));
         const toAdd = mapped.filter((e) => typeof e?.db_id === 'number' && !seen.has(e.db_id));
@@ -1673,10 +1726,13 @@ function App() {
     try {
       const older = await chatListBefore({ beforeId, limit });
       if (!older || older.length === 0) return;
+      const cutoff = Date.now() - COLLINS_ACTIVITY_RETENTION_MS;
       // DB returns newest-first; chat UI wants oldest-first.
       const mapped = older
         .map((r: any) => ({ id: Number(r.id), role: normalizeChatRole(r.role), ts: Number(r.ts), text: String(r.text || '') }))
+        .filter((m) => Number.isFinite(m.ts) && m.ts >= cutoff)
         .reverse();
+      if (mapped.length < 1) return;
       setPromptChat((prev) => {
         const seen = new Set(prev.map((m) => m?.id).filter((n) => typeof n === 'number'));
         const toAdd = mapped.filter((m) => typeof m?.id === 'number' && !seen.has(m.id));
@@ -1991,12 +2047,22 @@ function App() {
 	        });
 	      } else if (final && typeof final === 'object' && String((final as any).type || '') === 'error') {
 	        pushToast('error', String((final as any).error || 'stack start failed'));
-	      } else {
+      } else {
 	        pushToast('success', 'Stack started');
 	      }
 
       if (tradeAutoTraceEnabled) {
         try {
+          const channels = rendezvousChannels.slice(0, 64);
+          await runToolFinal(
+            'intercomswap_tradeauto_start',
+            {
+              channels: channels.length > 0 ? channels : ['0000intercomswapbtcusdt'],
+              trace_enabled: true,
+              ln_liquidity_mode: 'aggregate',
+            },
+            { auto_approve: true }
+          );
           await runToolFinal('intercomswap_tradeauto_trace_set', { trace_enabled: true }, { auto_approve: true });
         } catch (_e) {}
       }
@@ -2041,57 +2107,36 @@ function App() {
 	    }
 	  }
 
-  async function tradeAutoStartManual() {
+  async function setTradeLoggingMode(next: boolean) {
     if (runBusy || stackOpBusy) return;
     setRunBusy(true);
     setRunErr(null);
     try {
-      const channels = rendezvousChannels.slice(0, 64);
-      await runToolFinal('intercomswap_tradeauto_start', {
-        channels: channels.length > 0 ? channels : ['0000intercomswapbtcusdt'],
-        trace_enabled: tradeAutoTraceEnabled,
-      }, { auto_approve: true });
-      pushToast('success', 'Trade automation worker started');
-      await refreshPreflight({ includeTradeAuto: tradeAutoTraceEnabled });
-    } catch (e: any) {
-      const msg = e?.message || String(e);
-      setRunErr(msg);
-      pushToast('error', `Trade worker start failed: ${msg}`);
-    } finally {
-      setRunBusy(false);
-    }
-  }
-
-  async function tradeAutoStopManual() {
-    if (runBusy || stackOpBusy) return;
-    setRunBusy(true);
-    setRunErr(null);
-    try {
-      await runToolFinal('intercomswap_tradeauto_stop', { reason: 'manual_stop' }, { auto_approve: true });
-      pushToast('success', 'Trade automation worker stopped');
-      await refreshPreflight({ includeTradeAuto: tradeAutoTraceEnabled });
-    } catch (e: any) {
-      const msg = e?.message || String(e);
-      setRunErr(msg);
-      pushToast('error', `Trade worker stop failed: ${msg}`);
-    } finally {
-      setRunBusy(false);
-    }
-  }
-
-  async function setTradeAutoTraceMode(next: boolean) {
-    if (runBusy || stackOpBusy) return;
-    setRunBusy(true);
-    setRunErr(null);
-    try {
-      await runToolFinal('intercomswap_tradeauto_trace_set', { trace_enabled: next }, { auto_approve: true });
+      if (next) {
+        const channels = rendezvousChannels.slice(0, 64);
+        await runToolFinal(
+          'intercomswap_tradeauto_start',
+          {
+            channels: channels.length > 0 ? channels : ['0000intercomswapbtcusdt'],
+            trace_enabled: true,
+            ln_liquidity_mode: 'aggregate',
+          },
+          { auto_approve: true }
+        );
+        await runToolFinal('intercomswap_tradeauto_trace_set', { trace_enabled: true }, { auto_approve: true });
+      } else {
+        try {
+          await runToolFinal('intercomswap_tradeauto_trace_set', { trace_enabled: false }, { auto_approve: true });
+        } catch (_e) {}
+        await runToolFinal('intercomswap_tradeauto_stop', { reason: 'manual_stop' }, { auto_approve: true });
+      }
       setTradeAutoTraceEnabled(next);
-      pushToast('success', `Trade trace ${next ? 'enabled' : 'disabled'}`);
+      pushToast('success', `Trade logging ${next ? 'enabled' : 'disabled'}`);
       await refreshPreflight({ includeTradeAuto: next });
     } catch (e: any) {
       const msg = e?.message || String(e);
       setRunErr(msg);
-      pushToast('error', `Trade trace toggle failed: ${msg}`);
+      pushToast('error', `Trade logging toggle failed: ${msg}`);
     } finally {
       setRunBusy(false);
     }
@@ -2513,8 +2558,11 @@ function App() {
       const rfqChans = Array.isArray(body?.rfq_channels)
         ? body.rfq_channels.map((c: any) => String(c || '').trim()).filter(Boolean)
         : [];
-      const channel =
+      const channelRaw =
         rfqChans[0] || String(offerEvt?.channel || '').trim() || rendezvousChannels[0] || '0000intercomswapbtcusdt';
+      const channel = isSwapTradeChannelName(channelRaw)
+        ? (rendezvousChannels[0] || '0000intercomswapbtcusdt')
+        : channelRaw;
 
       // Adopt all offer lines (max 20). Each RFQ line has its own trade_id so multiple can run in parallel.
       const adoptedLines: RfqLine[] = [];
@@ -3537,7 +3585,13 @@ function App() {
     const keepViewport = Boolean(el && prevTop > 80);
 
     setPromptEvents((prev) => {
-      const next = [{ ...normalized, db_id: dbId }].concat(prev);
+      const cutoff = Date.now() - COLLINS_ACTIVITY_RETENTION_MS;
+      const next = [{ ...normalized, db_id: dbId }]
+        .concat(prev)
+        .filter((row) => {
+          const tsRow = eventTsMs(row);
+          return tsRow <= 0 || tsRow >= cutoff;
+        });
       if (next.length <= promptEventsMax) return next;
       return next.slice(0, promptEventsMax);
     });
@@ -3635,7 +3689,11 @@ function App() {
     const keepViewport = Boolean(el && prevTop > 80);
 
     setScEvents((prev) => {
-      const next = newestFirst.concat(prev);
+      const cutoff = Date.now() - COLLINS_SC_FEED_RETENTION_MS;
+      const next = newestFirst.concat(prev).filter((row) => {
+        const tsRow = eventTsMs(row);
+        return tsRow <= 0 || tsRow >= cutoff;
+      });
       if (next.length <= scEventsMax) return next;
       return next.slice(0, scEventsMax);
     });
@@ -3663,6 +3721,8 @@ function App() {
     if (!shouldKeepScEventInUi(e)) return;
     const msgTs = e?.message && typeof e.message.ts === 'number' ? e.message.ts : null;
     const ts = typeof e.ts === 'number' ? e.ts : msgTs !== null ? msgTs : Date.now();
+    const feedCutoff = Date.now() - COLLINS_SC_FEED_RETENTION_MS;
+    if (Number.isFinite(ts) && ts > 0 && ts < feedCutoff) return;
     const normalized = { ...e, ts };
     const dedupKey = deriveScEventDedupKey(normalized);
     if (dedupKey) {
@@ -4043,6 +4103,20 @@ function App() {
     return () => clearInterval(t);
   }, []);
 
+  // Periodic local DB hygiene to bound disk growth.
+  useEffect(() => {
+    const kindRaw = String(envInfo?.env_kind || '').trim().toLowerCase();
+    if (!kindRaw) return;
+    const run = () =>
+      void dbPruneRetention({
+        scFeedRetentionMs: COLLINS_SC_FEED_RETENTION_MS,
+        activityRetentionMs: COLLINS_ACTIVITY_RETENTION_MS,
+      }).catch(() => {});
+    run();
+    const t = setInterval(run, 30 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [envInfo?.env_kind]);
+
   // Stack observer:
   // - Periodically refresh the checklist while the stack is up (so the UI detects crashes/disconnects).
   // - Emit a toast if the stack transitions from READY -> not ready.
@@ -4155,17 +4229,41 @@ function App() {
       scUiFlushTimerRef.current = null;
     }
     setScSwapWatchChannelsState([]);
+    scSwapWatchFirstSeenAtRef.current.clear();
     setPromptEvents([]);
     setPromptChat([]);
 
     (async () => {
       try {
+        await dbPruneRetention({
+          scFeedRetentionMs: COLLINS_SC_FEED_RETENTION_MS,
+          activityRetentionMs: COLLINS_ACTIVITY_RETENTION_MS,
+        });
+      } catch (_e) {}
+      const now = Date.now();
+      const scCutoff = now - COLLINS_SC_FEED_RETENTION_MS;
+      const activityCutoff = now - COLLINS_ACTIVITY_RETENTION_MS;
+      try {
         const sc = await scListLatest({ limit: 400 });
-        setScEvents(sc.map((r) => ({ ...(r.evt || {}), db_id: r.id })));
+        setScEvents(
+          sc
+            .map((r) => ({ ...(r.evt || {}), db_id: r.id }))
+            .filter((e) => {
+              const ts = eventTsMs(e);
+              return ts <= 0 || ts >= scCutoff;
+            })
+        );
       } catch (_e) {}
       try {
         const pe = await promptListLatest({ limit: 300 });
-        setPromptEvents(pe.map((r) => ({ ...(r.evt || {}), db_id: r.id })));
+        setPromptEvents(
+          pe
+            .map((r) => ({ ...(r.evt || {}), db_id: r.id }))
+            .filter((e) => {
+              const ts = eventTsMs(e);
+              return ts <= 0 || ts >= activityCutoff;
+            })
+        );
       } catch (_e) {}
       try {
         const ch = await chatListLatest({ limit: 300 });
@@ -4178,6 +4276,7 @@ function App() {
               ts: Number(r.ts),
               text: String(r.text || ''),
             }))
+            .filter((m: any) => Number.isFinite(m.ts) && m.ts >= activityCutoff)
             .reverse()
         );
         requestAnimationFrame(scrollChatToBottom);
@@ -4480,12 +4579,6 @@ function App() {
                 </button>
               </div>
 
-              {stackAnyRunning ? (
-                <div className="muted small" style={{ marginTop: 6 }}>
-                  Observer: status auto-refreshes while running. {stackLastOkTs ? `Last READY: ${msToUtcIso(stackLastOkTs)}` : ''}
-                </div>
-              ) : null}
-
 		              {!stackGate.ok ? (
 		                <div className="alert warn">
 		                  <b>Trading setup incomplete.</b> Complete these items to enable trading:
@@ -4632,7 +4725,6 @@ function App() {
 		                    </button>
 		                  )}
 		                </div>
-		                <div className="muted small">Lightning routes automatically across your open channels when paying invoices.</div>
 		              </div>
             </Panel>
 
@@ -4690,20 +4782,14 @@ function App() {
                 </span>
                 <button
                   className={`btn ${tradeAutoTraceEnabled ? 'ghost' : 'primary'}`}
-                  onClick={() => void setTradeAutoTraceMode(!tradeAutoTraceEnabled)}
+                  onClick={() => void setTradeLoggingMode(!tradeAutoTraceEnabled)}
                   disabled={runBusy || stackOpBusy}
                 >
-                  {tradeAutoTraceEnabled ? 'Disable trace' : 'Enable trace'}
+                  {tradeAutoTraceEnabled ? 'Disable Trade Logging' : 'Enable Trade Logging'}
                 </button>
-                {tradeAutoStatus?.running ? (
-                  <button className="btn ghost" onClick={() => void tradeAutoStopManual()} disabled={runBusy || stackOpBusy}>
-                    Stop worker
-                  </button>
-                ) : (
-                  <button className="btn primary" onClick={() => void tradeAutoStartManual()} disabled={runBusy || stackOpBusy}>
-                    Start worker
-                  </button>
-                )}
+                <span className={`chip ${tradeAutoStatus?.running ? 'hi' : 'warn'}`}>
+                  {tradeAutoStatus?.running ? 'worker on' : 'worker off'}
+                </span>
                 {tradeAutoStatus?.stats?.actions !== undefined ? (
                   <span className="chip">actions: {Number(tradeAutoStatus.stats.actions || 0)}</span>
                 ) : null}
@@ -4716,7 +4802,7 @@ function App() {
               </div>
               {!tradeAutoTraceEnabled ? (
                 <div className="muted small" style={{ marginTop: 6 }}>
-                  Trace polling is disabled by default. Enable trace only when debugging settlement issues.
+                  Trade logging is disabled by default. Enabling it starts the backend worker and trace together.
                 </div>
               ) : null}
               {tradeAutoTraceEnabled && preflight?.tradeauto_error ? (
@@ -4919,7 +5005,7 @@ function App() {
 
         {activeTab === 'sell_usdt' ? (
           <div className="grid2">
-            <Panel title="New Offer (Sell USDT)">
+            <Panel title="Sell USDT">
               {!stackGate.ok ? (
                 <div className="alert warn">
                   <b>Offer setup incomplete.</b> Complete these checklist items to enable posting:
@@ -5379,7 +5465,7 @@ function App() {
 
         {activeTab === 'sell_btc' ? (
           <div className="grid2">
-            <Panel title="New RFQ (Sell BTC)">
+            <Panel title="Sell BTC">
               {!stackGate.ok ? (
                 <div className="alert warn">
                   <b>RFQ setup incomplete.</b> Complete these checklist items to enable posting:
@@ -5394,8 +5480,8 @@ function App() {
                   <span className="mono">Channel</span>
                 </div>
                 <select className="select" value={rfqChannel} onChange={(e) => setRfqChannel(e.target.value)}>
-                  {knownChannelsForInputs.length > 0 ? (
-                    knownChannelsForInputs.map((c) => (
+                  {knownRendezvousChannelsForInputs.length > 0 ? (
+                    knownRendezvousChannelsForInputs.map((c) => (
                       <option key={c} value={c}>
                         {c}
                       </option>
@@ -5741,7 +5827,10 @@ function App() {
                           onClick={() => {
                             try {
                               const a = j?.args && typeof j.args === 'object' ? j.args : null;
-                              if (typeof a?.channel === 'string') setRfqChannel(a.channel);
+                              if (typeof a?.channel === 'string') {
+                                const ch = String(a.channel || '').trim();
+                                if (!isSwapTradeChannelName(ch)) setRfqChannel(ch);
+                              }
                               const tradeIdRaw = typeof a?.trade_id === 'string' ? a.trade_id.trim() : '';
                               const trade_id = tradeIdRaw || `rfq-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
                               const btc_sats = typeof a?.btc_sats === 'number' ? a.btc_sats : 10_000;
@@ -6455,10 +6544,6 @@ function App() {
 		                </button>
 		              ) : null}
 
-		              <div className="muted small">
-		                Channel selection: when paying invoices, Lightning routes automatically across your open channels.
-		              </div>
-
               <div className="field">
                 <div className="field-hd">
                   <span className="mono">BTC Funding Address</span>
@@ -6697,14 +6782,6 @@ function App() {
                 </div>
 
                 <div className="row" style={{ marginTop: 8 }}>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={lnChannelPrivate}
-                      onChange={(e) => setLnChannelPrivate(e.target.checked)}
-                    />
-                    private channel
-                  </label>
 	                  <button
 	                    className="btn primary"
 	                    disabled={runBusy || lnWalletLocked || !lnPeerInput.trim() || !Number.isInteger(lnChannelAmountSats) || Number(lnChannelAmountSats) <= 0}
@@ -6725,9 +6802,7 @@ function App() {
                       const ok =
                         autoApprove ||
                         window.confirm(
-                          `Connect and open channel?\n\npeer: ${peer}\namount_sats: ${amount_sats}\nprivate: ${
-                            lnChannelPrivate ? 'yes' : 'no'
-                          }\nfee: ${sat_per_vbyte > 0 ? `${sat_per_vbyte} sat/vB` : '(default)'}`
+                          `Connect and open channel?\n\npeer: ${peer}\namount_sats: ${amount_sats}\nfee: ${sat_per_vbyte > 0 ? `${sat_per_vbyte} sat/vB` : '(default)'}`
                         );
                       if (!ok) return;
                       try {
@@ -6746,7 +6821,6 @@ function App() {
                           {
                             node_id,
                             amount_sats,
-                            private: lnChannelPrivate,
                             sat_per_vbyte: sat_per_vbyte > 0 ? sat_per_vbyte : undefined,
                           },
                           { auto_approve: true }
@@ -8879,16 +8953,18 @@ function QuoteRow({
   const solWindow = body?.sol_refund_window_sec;
   const validUntil = body?.valid_until_unix;
   const validUntilIso = typeof validUntil === 'number' ? unixSecToUtcIso(validUntil) : '';
+  const expired = typeof validUntil === 'number' ? validUntil <= Math.floor(Date.now() / 1000) : false;
   const oracleBtcUsd = oracle && typeof oracle.btc_usd === 'number' ? oracle.btc_usd : null;
   const oracleUsdtUsd = oracle && typeof oracle.usdt_usd === 'number' ? oracle.usdt_usd : null;
   const btcUsd = btcSats !== null && oracleBtcUsd ? (btcSats / 1e8) * oracleBtcUsd : null;
   const usdtNum = usdtAtomic ? atomicToNumber(usdtAtomic, 6) : null;
   const usdtUsd = usdtNum !== null && oracleUsdtUsd ? usdtNum * oracleUsdtUsd : null;
   return (
-    <div className="rowitem" role="button" onClick={onSelect}>
+    <div className={`rowitem ${expired ? 'expired' : ''}`} role="button" onClick={onSelect}>
       <div className="rowitem-top">
         {postedIso ? <span className="mono dim">{postedIso}</span> : null}
         <span className="mono chip">{evt.channel}</span>
+        {expired ? <span className="mono chip warn">expired</span> : null}
         {tradeId ? <span className="mono dim">{tradeId}</span> : null}
       </div>
       <div className="rowitem-mid">
@@ -8918,6 +8994,8 @@ function QuoteRow({
       <div className="rowitem-bot">
         <button
           className="btn small primary"
+          disabled={expired}
+          title={expired ? 'Quote expired' : ''}
           onClick={(e) => {
             e.stopPropagation();
             onAccept();
@@ -8957,6 +9035,7 @@ function RfqRow({
   const maxWin = body?.max_sol_refund_window_sec;
   const validUntil = body?.valid_until_unix;
   const validUntilIso = typeof validUntil === 'number' ? unixSecToUtcIso(validUntil) : '';
+  const expired = typeof validUntil === 'number' ? validUntil <= Math.floor(Date.now() / 1000) : false;
   const oracleBtcUsd = oracle && typeof oracle.btc_usd === 'number' ? oracle.btc_usd : null;
   const oracleUsdtUsd = oracle && typeof oracle.usdt_usd === 'number' ? oracle.usdt_usd : null;
   const btcUsd = btcSats !== null && oracleBtcUsd ? (btcSats / 1e8) * oracleBtcUsd : null;
@@ -8969,11 +9048,12 @@ function RfqRow({
         ? 'direction'
         : '';
   return (
-    <div className="rowitem" role="button" onClick={onSelect}>
+    <div className={`rowitem ${expired ? 'expired' : ''}`} role="button" onClick={onSelect}>
       <div className="rowitem-top">
         {postedIso ? <span className="mono dim">{postedIso}</span> : null}
         <span className="mono chip">{evt.channel}</span>
         {badge ? <span className="mono chip hi">{badge}</span> : null}
+        {expired ? <span className="mono chip warn">expired</span> : null}
         <span className="mono dim">{evt.trade_id || evt?.message?.trade_id || ''}</span>
       </div>
       <div className="rowitem-mid">
@@ -9007,6 +9087,8 @@ function RfqRow({
         {showQuote ? (
           <button
             className="btn small primary"
+            disabled={expired}
+            title={expired ? 'RFQ expired' : ''}
             onClick={(e) => {
               e.stopPropagation();
               onQuote();
@@ -9052,6 +9134,7 @@ function OfferRow({
   const maxWin = o?.max_sol_refund_window_sec;
   const validUntil = body?.valid_until_unix;
   const validUntilIso = typeof validUntil === 'number' ? unixSecToUtcIso(validUntil) : '';
+  const expired = typeof validUntil === 'number' ? validUntil <= Math.floor(Date.now() / 1000) : false;
   const rfqChans = Array.isArray(body?.rfq_channels) ? body.rfq_channels.map((c: any) => String(c || '').trim()).filter(Boolean) : [];
   const oracleBtcUsd = oracle && typeof oracle.btc_usd === 'number' ? oracle.btc_usd : null;
   const oracleUsdtUsd = oracle && typeof oracle.usdt_usd === 'number' ? oracle.usdt_usd : null;
@@ -9067,11 +9150,12 @@ function OfferRow({
         : '';
 
   return (
-    <div className="rowitem" role="button" onClick={onSelect}>
+    <div className={`rowitem ${expired ? 'expired' : ''}`} role="button" onClick={onSelect}>
       <div className="rowitem-top">
         {postedIso ? <span className="mono dim">{postedIso}</span> : null}
         <span className="mono chip">{evt.channel}</span>
         {badge ? <span className="mono chip hi">{badge}</span> : null}
+        {expired ? <span className="mono chip warn">expired</span> : null}
         {name ? <span className="mono dim">{name}</span> : null}
         <span className="mono dim">{evt.trade_id || evt?.message?.trade_id || ''}</span>
       </div>
@@ -9109,6 +9193,8 @@ function OfferRow({
         {showRespond ? (
           <button
             className="btn small primary"
+            disabled={expired}
+            title={expired ? 'Offer expired' : ''}
             onClick={(e) => {
               e.stopPropagation();
               onRespond();

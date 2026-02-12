@@ -232,7 +232,7 @@ export async function lnConnect(opts, { peer }) {
   return lnClnCli({ ...opts, args: ['connect', p] });
 }
 
-export async function lnFundChannel(opts, { nodeId, amountSats, privateFlag = false, satPerVbyte = null, block = true }) {
+export async function lnFundChannel(opts, { nodeId, amountSats, satPerVbyte = null, block = true }) {
   const id = String(nodeId || '').trim();
   const amt = Number(amountSats);
   if (!id) throw new Error('Missing nodeId');
@@ -240,7 +240,6 @@ export async function lnFundChannel(opts, { nodeId, amountSats, privateFlag = fa
 
   if (opts.impl === 'lnd') {
     const args = ['openchannel', '--node_key', id, '--local_amt', String(amt)];
-    if (privateFlag) args.push('--private');
     if (Number.isInteger(satPerVbyte) && satPerVbyte > 0) args.push('--sat_per_vbyte', String(Math.trunc(satPerVbyte)));
     if (block) args.push('--block');
     return lnLndCli({ ...opts, args });
@@ -248,7 +247,6 @@ export async function lnFundChannel(opts, { nodeId, amountSats, privateFlag = fa
 
   // For CLN, use named args so we can safely plumb optional fields without relying on positional ordering.
   const args = ['fundchannel', `id=${id}`, `amount=${String(amt)}`];
-  if (privateFlag) args.push('announce=false');
   if (Number.isInteger(satPerVbyte) && satPerVbyte > 0) {
     // CLN expects feerate as "<n>perkw" (sats per 1000 weight units). 1 vB = 4 weight units -> 1kw = 250 vB.
     const perkw = Math.max(1, Math.trunc(satPerVbyte) * 250);
@@ -397,7 +395,7 @@ export async function lnCloseChannel(opts, { channelId, force = false, satPerVby
   return lnClnCli({ ...opts, args: ['close', id] });
 }
 
-export async function lnInvoice(opts, { amountMsat, label, description, expirySec = null, privateRouteHints = false }) {
+export async function lnInvoice(opts, { amountMsat, label, description, expirySec = null }) {
   const desc = String(description || '').trim();
   if (!desc) throw new Error('Missing invoice description');
 
@@ -405,48 +403,12 @@ export async function lnInvoice(opts, { amountMsat, label, description, expirySe
     const memo = String(label || '').trim() ? `${String(label).trim()} ${desc}`.trim() : desc;
     const amt = BigInt(String(amountMsat));
     if (amt <= 0n) throw new Error('Invalid amountMsat');
-    const invCfg = {
-      privateEnabled: privateRouteHints === true,
-      privateFlag: '--private',
-    };
-    const buildArgs = () => {
-      const args = ['addinvoice', '--amt_msat', String(amt), '--memo', memo];
-      if (expirySec !== null && expirySec !== undefined) {
-        const exp = Number(expirySec);
-        if (Number.isFinite(exp) && exp > 0) args.push('--expiry', String(exp));
-      }
-      if (invCfg.privateEnabled && invCfg.privateFlag) args.push(invCfg.privateFlag);
-      return args;
-    };
-
-    let r;
-    let lastErr = null;
-    for (let i = 0; i < 6; i += 1) {
-      try {
-        r = await lnLndCli({ ...opts, args: buildArgs() });
-        break;
-      } catch (err) {
-        lastErr = err;
-        const privateFlag = String(invCfg.privateFlag || '').trim();
-        if (invCfg.privateEnabled && privateFlag && isUnknownFlagError(err, privateFlag)) {
-          if (privateFlag === '--private') {
-            invCfg.privateFlag = '--private_only';
-            continue;
-          }
-          invCfg.privateEnabled = false;
-          invCfg.privateFlag = '';
-          continue;
-        }
-        const unknownAny = /flag provided but not defined|unknown flag/i.test(String(err?.message || ''));
-        if (invCfg.privateEnabled && unknownAny) {
-          invCfg.privateEnabled = false;
-          invCfg.privateFlag = '';
-          continue;
-        }
-        throw err;
-      }
+    const args = ['addinvoice', '--amt_msat', String(amt), '--memo', memo];
+    if (expirySec !== null && expirySec !== undefined) {
+      const exp = Number(expirySec);
+      if (Number.isFinite(exp) && exp > 0) args.push('--expiry', String(exp));
     }
-    if (!r) throw lastErr || new Error('LND addinvoice failed');
+    const r = await lnLndCli({ ...opts, args });
 
     const bolt11 = String(r?.payment_request || r?.paymentRequest || '').trim();
     if (!bolt11) throw new Error('LND addinvoice missing payment_request');

@@ -264,7 +264,7 @@ Edit `onchain/prompt/setup.json`:
 - `ln.wallet_password_file`: recommended explicit LND unlock password file path under `onchain/` (example: `onchain/lnd/mainnet/maker/wallet.pw`)
 - optional: `receipts.db`, `ln.*`, `solana.*` (only needed for tools that touch those subsystems)
 - trade automation bootstrap (optional):
-  - `server.tradeauto_autostart` (default `true`) keeps backend trade automation running after promptd restarts.
+  - `server.tradeauto_autostart` (default `false`) keeps backend trade automation off until explicitly enabled.
   - `server.tradeauto_channels` (default `["0000intercomswapbtcusdt","0000intercom"]`).
   - `server.tradeauto_trace_enabled` (default `false`), `server.tradeauto_autostart_retry_ms` (default `5000`), `server.tradeauto_autostart_max_attempts` (default `24`).
 
@@ -1452,9 +1452,9 @@ E2E flakiness guidance (timing vs determinism):
 Lightning channel note:
 - LN channels are **not opened per trade**. Open channels ahead of time and reuse them for many swaps.
 - A direct channel is only between 2 LN nodes, but you can usually pay many different counterparties via routing across the LN network (if a route exists).
-- Private-channel routing note (LND):
-  - Maker swap invoices request private route hints only when active private channels exist.
-  - If the maker is private-only and invoice decode still shows no route hints, expect `NO_ROUTE` until routing visibility/hints are fixed.
+- Channel policy note:
+  - Channel opening is public-only in this stack (no private-channel toggle).
+  - Invoice creation follows normal routing behavior; settlement requires reachable routes and receiver inbound.
 - Collin will block RFQ/Offer/Bot tools until at least one LN channel exists (to prevent “can’t settle” operator footguns).
 
 Autopost (Collin "Run as bot") safety:
@@ -1534,7 +1534,7 @@ scripts/lnctl.sh info --impl cln --backend cli --network bitcoin
 # - The receiver (maker) needs inbound liquidity to receive invoices.
 # For deterministic bring-up between 2 nodes, open a direct channel (taker -> maker) once and reuse it for many swaps.
 #
-# Example (LND, docker backend): open a private channel from taker to maker.
+# Example (LND, docker backend): open a public channel from taker to maker.
 # 1) Read node ids (identity_pubkey).
 scripts/lnctl.sh info --impl lnd --backend docker --network mainnet \
   --compose-file dev/lnd-mainnet/docker-compose.yml --service lnd-maker

@@ -707,7 +707,7 @@ Recently added/changed tools and guardrails:
 - `intercomswap_swap_status_post`: signed status/liveness envelope helper for swap channels.
 - `intercomswap_stack_start`: now auto-starts backend trade automation (rendezvous channels + settlement stages) and reports worker status/errors.
 - `intercomswap_stack_stop`: now also stops backend trade automation.
-- Swap maker invoice path (`intercomswap_swap_ln_invoice_create_and_post`) now requests private route hints only when active private LND channels exist; public-only setups are not forced into private invoice mode.
+- Swap maker invoice path (`intercomswap_swap_ln_invoice_create_and_post`) now uses normal invoice routing behavior (no forced private-route-hint mode).
 - Autopost safety: jobs stop on insufficient-funds/liquidity errors (in addition to expiry/fill stops).
 
 When function signatures change:
@@ -735,7 +735,7 @@ Edit `onchain/prompt/setup.json`:
 - `receipts.db` (optional, for `intercomswap_receipts_*` tools)
 - `ln.*`, `solana.*` (optional, depending on which tools you want enabled)
 - trade automation bootstrap (optional, defaults shown):
-  - `server.tradeauto_autostart` (default `true`): auto-start backend trade worker after promptd restart.
+  - `server.tradeauto_autostart` (default `false`): backend trade worker is off by default after promptd restart.
   - `server.tradeauto_channels` (default `["0000intercomswapbtcusdt","0000intercom"]`).
   - `server.tradeauto_trace_enabled` (default `false`).
   - `server.tradeauto_autostart_retry_ms` (default `5000`), `server.tradeauto_autostart_max_attempts` (default `24`).

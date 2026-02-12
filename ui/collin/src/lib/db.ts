@@ -63,6 +63,10 @@ interface CollinDb extends DBSchema {
 
 let _dbName = 'collin';
 const DB_VERSION = 2;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+export const COLLINS_SC_FEED_RETENTION_MS = 3 * MS_PER_DAY;
+export const COLLINS_ACTIVITY_RETENTION_MS = 5 * MS_PER_DAY;
 
 let _dbPromise: Promise<IDBPDatabase<CollinDb>> | null = null;
 
@@ -208,4 +212,70 @@ export async function chatListBefore({
 
 export async function chatListLatest({ limit = 200 }: { limit?: number } = {}): Promise<ChatMessageStored[]> {
   return chatListBefore({ beforeId: null, limit });
+}
+
+type DbStoreName = 'sc_events' | 'prompt_events' | 'chat_messages';
+
+async function pruneStoreOlderThan({
+  storeName,
+  cutoffTsMs,
+  batchSize = 500,
+}: {
+  storeName: DbStoreName;
+  cutoffTsMs: number;
+  batchSize?: number;
+}) {
+  const cutoff = Math.trunc(Number(cutoffTsMs));
+  if (!Number.isFinite(cutoff) || cutoff < 1) return 0;
+  const chunk = Number.isFinite(batchSize) && batchSize > 0 ? Math.max(50, Math.trunc(batchSize)) : 500;
+  const d = await db();
+  let deletedTotal = 0;
+
+  while (true) {
+    const tx = d.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const byTs = store.index('by_ts');
+    const range = IDBKeyRange.upperBound(cutoff, true);
+    let cursor = await byTs.openCursor(range, 'next');
+    let deletedInBatch = 0;
+
+    while (cursor && deletedInBatch < chunk) {
+      await cursor.delete();
+      deletedInBatch += 1;
+      cursor = await cursor.continue();
+    }
+
+    await tx.done;
+    deletedTotal += deletedInBatch;
+    if (deletedInBatch < chunk) break;
+  }
+
+  return deletedTotal;
+}
+
+export async function dbPruneRetention({
+  nowMs = Date.now(),
+  scFeedRetentionMs = COLLINS_SC_FEED_RETENTION_MS,
+  activityRetentionMs = COLLINS_ACTIVITY_RETENTION_MS,
+}: {
+  nowMs?: number;
+  scFeedRetentionMs?: number;
+  activityRetentionMs?: number;
+} = {}) {
+  const now = Math.trunc(Number(nowMs));
+  if (!Number.isFinite(now) || now < 1) {
+    return { sc_events_deleted: 0, prompt_events_deleted: 0, chat_messages_deleted: 0 };
+  }
+  const feedRetention = Number.isFinite(scFeedRetentionMs) && scFeedRetentionMs > 0 ? Math.trunc(scFeedRetentionMs) : COLLINS_SC_FEED_RETENTION_MS;
+  const activityRetention =
+    Number.isFinite(activityRetentionMs) && activityRetentionMs > 0 ? Math.trunc(activityRetentionMs) : COLLINS_ACTIVITY_RETENTION_MS;
+
+  const scCutoff = now - feedRetention;
+  const activityCutoff = now - activityRetention;
+
+  const sc_events_deleted = await pruneStoreOlderThan({ storeName: 'sc_events', cutoffTsMs: scCutoff });
+  const prompt_events_deleted = await pruneStoreOlderThan({ storeName: 'prompt_events', cutoffTsMs: activityCutoff });
+  const chat_messages_deleted = await pruneStoreOlderThan({ storeName: 'chat_messages', cutoffTsMs: activityCutoff });
+
+  return { sc_events_deleted, prompt_events_deleted, chat_messages_deleted };
 }

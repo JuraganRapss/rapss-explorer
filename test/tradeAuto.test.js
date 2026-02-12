@@ -933,6 +933,101 @@ test('tradeauto: ln_pay failure auto-leave is deterministic and does not leave e
   }
 });
 
+test('tradeauto: unroutable invoice precheck aborts immediately and traces once', async () => {
+  const tradeId = 'swap_test_6b';
+  const swapChannel = `swap:${tradeId}`;
+  const now = Date.now();
+
+  const termsEnv = env('swap.terms', tradeId, MAKER, {
+    btc_sats: 1000,
+    usdt_amount: '670000',
+    sol_mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+    sol_recipient: SOL_RECIPIENT,
+    sol_refund: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM',
+    sol_refund_after_unix: Math.floor((now + 72 * 3600 * 1000) / 1000),
+    ln_receiver_peer: MAKER,
+    ln_payer_peer: TAKER,
+    trade_fee_collector: SOL_RECIPIENT,
+  });
+  const invoiceEnv = env('swap.ln_invoice', tradeId, MAKER, {
+    bolt11: 'lnbc10u1p5cemg5pp503h4ceyly03nvgevmevjv4jrlrsr3s6tg89r8surn4lext8hpnfqdygwfn8zttjvecj6vfhxucrsdpnxymrydf4x5kkydnrxenrqwp595cnwdes8q6rxdp3xgcrvvfqf9h8getjvdhk6grnwashqgrjvecj6vfhxucrsdpnxymrydf4x5kkydnrxenrqwp5cqzzsxqrrsssp5k8zm63dhvg36cjhs48ckxk2glm7lc5hk94ahjhuzpwqu68hscqlq9qxpqysgqdkwmv5hvuke35jept3g8fc46cqlupsn7juv2scmqr530u8ywdv3xxp6walt49s7tlzszjkqdwc8f4emwue5qqelqkfpxz725cxjjdcqpa8930v',
+    payment_hash_hex: '7c6f5c649f23e336232cde59265643f8e038c34b41ca33c3839d7f932cf70cd2',
+  });
+  const escrowEnv = env('swap.sol_escrow_created', tradeId, MAKER, {
+    payment_hash_hex: '7c6f5c649f23e336232cde59265643f8e038c34b41ca33c3839d7f932cf70cd2',
+    mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+    amount: '670000',
+    recipient: SOL_RECIPIENT,
+    refund: '2JfWqV6nS6f7QjE9pP2WfW2z1CYKo7U2uC8hYq7pW6sM',
+    refund_after_unix: Math.floor((now + 72 * 3600 * 1000) / 1000),
+    trade_fee_collector: SOL_RECIPIENT,
+    tx_sig: '6'.repeat(88),
+  });
+
+  const events = [
+    { seq: 1, ts: now + 1, channel: swapChannel, kind: 'swap.terms', message: termsEnv },
+    { seq: 2, ts: now + 2, channel: swapChannel, kind: 'swap.accept', message: env('swap.accept', tradeId, TAKER, {}) },
+    { seq: 3, ts: now + 3, channel: swapChannel, kind: 'swap.ln_invoice', message: invoiceEnv },
+    { seq: 4, ts: now + 4, channel: swapChannel, kind: 'swap.sol_escrow_created', message: escrowEnv },
+  ];
+
+  const left = [];
+  let lnPayAttempts = 0;
+  const mgr = new TradeAutoManager({
+    scLogInfo: () => ({ latest_seq: 4 }),
+    scLogRead: () => ({ latest_seq: 4, events }),
+    runTool: async ({ tool, args }) => {
+      if (tool === 'intercomswap_sc_subscribe') return { type: 'subscribed' };
+      if (tool === 'intercomswap_sc_info') return { peer: TAKER };
+      if (tool === 'intercomswap_sol_signer_pubkey') return { pubkey: SOL_RECIPIENT };
+      if (tool === 'intercomswap_sc_stats') return { channels: [swapChannel] };
+      if (tool === 'intercomswap_swap_ln_pay_and_post_verified') {
+        lnPayAttempts += 1;
+        throw new Error('intercomswap_swap_ln_pay_and_post_verified: unroutable invoice precheck: destination deadbeef has no route hints and this node has no direct active channel to destination');
+      }
+      if (tool === 'intercomswap_sc_leave') {
+        left.push(String(args?.channel || ''));
+        return { type: 'left', channel: String(args?.channel || '') };
+      }
+      throw new Error(`unexpected tool: ${tool}`);
+    },
+  });
+
+  try {
+    await mgr.start({
+      channels: ['0000intercomswapbtcusdt'],
+      interval_ms: 50,
+      enable_quote_from_offers: false,
+      enable_quote_from_rfqs: false,
+      enable_accept_quotes: false,
+      enable_invite_from_accepts: false,
+      enable_join_invites: false,
+      enable_settlement: true,
+      trace_enabled: true,
+      ln_pay_fail_leave_attempts: 5,
+      ln_pay_fail_leave_min_wait_ms: 60_000,
+      ln_pay_retry_cooldown_ms: 50,
+      swap_auto_leave_cooldown_ms: 200,
+    });
+
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && left.length < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(lnPayAttempts, 1, 'unroutable precheck should abort without repeated ln_pay attempts');
+    assert.ok(left.includes(swapChannel), 'expected immediate auto-leave for unroutable precheck');
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const st = mgr.status();
+    const abortedEvents = (Array.isArray(st.recent_events) ? st.recent_events : []).filter(
+      (e) => e && e.type === 'ln_pay_aborted' && e.trade_id === tradeId
+    );
+    assert.equal(abortedEvents.length, 1, 'expected a single ln_pay_aborted trace event for the trade');
+  } finally {
+    await mgr.stop({ reason: 'test_done' });
+  }
+});
+
 test('tradeauto: waiting_terms replays latest quote_accept for reposted trade ids', async () => {
   const tradeId = 'swap_test_5';
   const oldSwapChannel = `swap:${tradeId}:old`;

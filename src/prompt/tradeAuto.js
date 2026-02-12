@@ -107,6 +107,34 @@ function epochToMs(value) {
   return n > 1e12 ? Math.trunc(n) : Math.trunc(n * 1000);
 }
 
+function envelopeValidUntilUnix(evt) {
+  const body = isObject(evt?.message?.body) ? evt.message.body : {};
+  const n = toIntOrNull(body?.valid_until_unix);
+  return n !== null && n > 0 ? n : null;
+}
+
+function isEnvelopeExpired(evt, nowSec = Math.floor(Date.now() / 1000)) {
+  const validUntil = envelopeValidUntilUnix(evt);
+  return validUntil !== null && validUntil <= nowSec;
+}
+
+function isPermanentNegotiationError(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return false;
+  if (s.includes(' expired')) return true;
+  if (s.includes('terminal')) return true;
+  if (s.includes('already joined')) return true;
+  if (s.includes('already accepted')) return true;
+  if (s.includes('already active')) return true;
+  if (s.includes('already in progress')) return true;
+  if (s.includes('already open')) return true;
+  if (s.includes('swap_invite_exists')) return true;
+  if (s.includes('listing_in_progress')) return true;
+  if (s.includes('listing_filled')) return true;
+  if (s.includes('quote_accept already exists')) return true;
+  return false;
+}
+
 function pruneSetByLimit(set, limit) {
   const max = Math.max(1, Math.trunc(Number(limit) || 1));
   while (set.size > max) {
@@ -646,7 +674,7 @@ export class TradeAutoManager {
     this._trace('stage_retry', { stage: String(stageKey), cooldown_ms: ms });
   }
 
-  _recordLnPayFailure({ tradeId, channel, error }) {
+  _recordLnPayFailure({ tradeId, channel, error, forceAbort = false }) {
     if (!tradeId || !channel) return { state: null, shouldAbort: false, elapsedMs: 0 };
     const now = Date.now();
     const normalizedChannel = String(channel || '').trim();
@@ -672,7 +700,15 @@ export class TradeAutoManager {
 
     const threshold = Math.max(2, Number(this.opts?.ln_pay_fail_leave_attempts || 3));
     const minWaitMs = Math.max(1_000, Number(this.opts?.ln_pay_fail_leave_min_wait_ms || 20_000));
+    if (forceAbort) {
+      state.failures = Math.max(Number(state.failures || 0), threshold);
+      const forcedFirstFailAt = now - minWaitMs;
+      if (!Number.isFinite(Number(state.firstFailAt)) || Number(state.firstFailAt) > forcedFirstFailAt) {
+        state.firstFailAt = forcedFirstFailAt;
+      }
+    }
     const elapsedMs = Math.max(0, now - Number(state.firstFailAt || now));
+
     const shouldAbort = Number(state.failures || 0) >= threshold && elapsedMs >= minWaitMs;
     if (shouldAbort && !Number(state.abortedAt || 0)) {
       state.abortedAt = now;
@@ -1162,6 +1198,7 @@ export class TradeAutoManager {
       let actionsLeft = 12;
 
       if ((this.opts.enable_quote_from_offers || this.opts.enable_quote_from_rfqs) && actionsLeft > 0) {
+        const nowSec = Math.floor(Date.now() / 1000);
         const rfqQueue = [...activeEvents]
           .filter((e) => envelopeKind(e) === 'swap.rfq')
           .reverse();
@@ -1171,6 +1208,16 @@ export class TradeAutoManager {
           const sig = envelopeSig(rfqEvt);
           if (!sig || this._autoQuotedRfqSig.has(sig)) continue;
           if (!this._canRunEvent('quote_from_offer', sig)) continue;
+          if (isEnvelopeExpired(rfqEvt, nowSec)) {
+            this._autoQuotedRfqSig.add(sig);
+            this._clearEventRetry('quote_from_offer', sig);
+            this._trace('auto_quote_skip_expired_rfq', {
+              trade_id: envelopeTradeId(rfqEvt),
+              channel: String(rfqEvt?.channel || '').trim(),
+              sig: sig.slice(0, 16),
+            });
+            continue;
+          }
           const tradeId = envelopeTradeId(rfqEvt);
           const tradeBusy = (() => {
             if (!tradeId) return false;
@@ -1229,19 +1276,32 @@ export class TradeAutoManager {
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            const errMsg = err?.message || String(err);
             this._trace('auto_quote_fail', {
               trade_id: envelopeTradeId(rfqEvt),
               channel: String(rfqEvt?.channel || '').trim(),
               sig: sig.slice(0, 16),
-              error: err?.message || String(err),
+              error: errMsg,
             });
-            this._markEventRetry('quote_from_offer', sig, 5000);
+            if (isPermanentNegotiationError(errMsg)) {
+              this._autoQuotedRfqSig.add(sig);
+              this._clearEventRetry('quote_from_offer', sig);
+              this._trace('auto_quote_drop_permanent', {
+                trade_id: envelopeTradeId(rfqEvt),
+                channel: String(rfqEvt?.channel || '').trim(),
+                sig: sig.slice(0, 16),
+                error: errMsg,
+              });
+            } else {
+              this._markEventRetry('quote_from_offer', sig, 5000);
+            }
             this._log(`[tradeauto] auto-quote failed: ${err?.message || String(err)}`);
           }
         }
       }
 
       if (this.opts.enable_accept_quotes && actionsLeft > 0) {
+        const nowSec = Math.floor(Date.now() / 1000);
         const quoteQueue = [...ctx.quoteEvents].reverse();
         for (const quoteEvt of quoteQueue) {
           if (actionsLeft <= 0) break;
@@ -1249,6 +1309,16 @@ export class TradeAutoManager {
           const sig = envelopeSig(quoteEvt);
           if (!sig || this._autoAcceptedQuoteSig.has(sig)) continue;
           if (!this._canRunEvent('accept_quote', sig)) continue;
+          if (isEnvelopeExpired(quoteEvt, nowSec)) {
+            this._autoAcceptedQuoteSig.add(sig);
+            this._clearEventRetry('accept_quote', sig);
+            this._trace('auto_accept_skip_expired_quote', {
+              trade_id: envelopeTradeId(quoteEvt),
+              channel: String(quoteEvt?.channel || '').trim(),
+              quote_sig: sig.slice(0, 16),
+            });
+            continue;
+          }
           const tradeId = envelopeTradeId(quoteEvt);
           if (!tradeId || !ctx.myRfqTradeIds.has(tradeId)) continue;
           if (ctx.terminalTradeIds.has(tradeId)) continue;
@@ -1274,13 +1344,25 @@ export class TradeAutoManager {
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            const errMsg = err?.message || String(err);
             this._trace('auto_accept_fail', {
               trade_id: tradeId,
               channel: String(quoteEvt?.channel || '').trim(),
               quote_sig: sig.slice(0, 16),
-              error: err?.message || String(err),
+              error: errMsg,
             });
-            this._markEventRetry('accept_quote', sig, 5000);
+            if (isPermanentNegotiationError(errMsg)) {
+              this._autoAcceptedQuoteSig.add(sig);
+              this._clearEventRetry('accept_quote', sig);
+              this._trace('auto_accept_drop_permanent', {
+                trade_id: tradeId,
+                channel: String(quoteEvt?.channel || '').trim(),
+                quote_sig: sig.slice(0, 16),
+                error: errMsg,
+              });
+            } else {
+              this._markEventRetry('accept_quote', sig, 5000);
+            }
             this._log(`[tradeauto] auto-accept failed: ${err?.message || String(err)}`);
           }
         }
@@ -1327,13 +1409,25 @@ export class TradeAutoManager {
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            const errMsg = err?.message || String(err);
             this._trace('auto_invite_fail', {
               trade_id: envelopeTradeId(e),
               channel: String(e?.channel || myQuote.channel || '').trim(),
               accept_sig: sig.slice(0, 16),
-              error: err?.message || String(err),
+              error: errMsg,
             });
-            this._markEventRetry('invite_from_accept', sig, 5000);
+            if (isPermanentNegotiationError(errMsg)) {
+              this._autoInvitedAcceptSig.add(sig);
+              this._clearEventRetry('invite_from_accept', sig);
+              this._trace('auto_invite_drop_permanent', {
+                trade_id: envelopeTradeId(e),
+                channel: String(e?.channel || myQuote.channel || '').trim(),
+                accept_sig: sig.slice(0, 16),
+                error: errMsg,
+              });
+            } else {
+              this._markEventRetry('invite_from_accept', sig, 5000);
+            }
             this._log(`[tradeauto] auto-invite failed: ${err?.message || String(err)}`);
           }
         }
@@ -1383,13 +1477,25 @@ export class TradeAutoManager {
             actionsLeft -= 1;
             this._stats.actions += 1;
           } catch (err) {
+            const errMsg = err?.message || String(err);
             this._trace('auto_join_fail', {
               trade_id: tradeId,
               channel: String(e?.channel || '').trim(),
               invite_sig: sig.slice(0, 16),
-              error: err?.message || String(err),
+              error: errMsg,
             });
-            this._markEventRetry('join_invite', sig, 5000);
+            if (isPermanentNegotiationError(errMsg)) {
+              this._autoJoinedInviteSig.add(sig);
+              this._clearEventRetry('join_invite', sig);
+              this._trace('auto_join_drop_permanent', {
+                trade_id: tradeId,
+                channel: String(e?.channel || '').trim(),
+                invite_sig: sig.slice(0, 16),
+                error: errMsg,
+              });
+            } else {
+              this._markEventRetry('join_invite', sig, 5000);
+            }
             this._log(`[tradeauto] auto-join failed: ${err?.message || String(err)}`);
           }
         }
@@ -1868,10 +1974,8 @@ export class TradeAutoManager {
             const stageKey = `${tradeId}:ln_pay`;
             const lnPayFailState = this._lnPayFailByTrade.get(tradeId) || null;
             if (lnPayFailState && Number(lnPayFailState.abortedAt || 0) > 0) {
-              const traceCd = Math.max(1_000, Math.trunc(Number(this.opts?.waiting_terms_trace_cooldown_ms || 15_000)));
-              const nowMs = Date.now();
-              if (!Number(lnPayFailState.lastAbortTraceAt || 0) || nowMs - Number(lnPayFailState.lastAbortTraceAt || 0) >= traceCd) {
-                lnPayFailState.lastAbortTraceAt = nowMs;
+              if (!Number(lnPayFailState.lastAbortTraceAt || 0)) {
+                lnPayFailState.lastAbortTraceAt = Date.now();
                 this._lnPayFailByTrade.set(tradeId, lnPayFailState);
                 this._trace('ln_pay_aborted', {
                   trade_id: tradeId,
@@ -1907,10 +2011,12 @@ export class TradeAutoManager {
               } catch (err) {
                 const errMsg = err?.message || String(err);
                 this._trace('stage_fail', { stage: stageKey, trade_id: tradeId, error: errMsg });
+                const forceAbort = /unroutable invoice precheck/i.test(errMsg);
                 const failRec = this._recordLnPayFailure({
                   tradeId,
                   channel: swapChannel,
                   error: errMsg,
+                  forceAbort,
                 });
                 const failState = failRec?.state || null;
                 const elapsedMs = Math.max(0, Math.trunc(Number(failRec?.elapsedMs || 0)));

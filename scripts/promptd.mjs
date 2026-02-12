@@ -244,8 +244,8 @@ async function main() {
             // If the model returns invalid structured output (eg, plans instead of tool calls),
             // promptd will ask it to re-emit valid JSON up to this many times.
             max_repairs: 2,
-            // Keep backend trade automation running by default, even after promptd restarts.
-            tradeauto_autostart: true,
+            // Keep backend trade automation disabled by default; operators can enable on demand.
+            tradeauto_autostart: false,
             tradeauto_channels: ['0000intercomswapbtcusdt', '0000intercom'],
             tradeauto_trace_enabled: false,
             tradeauto_autostart_retry_ms: 5000,

@@ -893,7 +893,7 @@ export const INTERCOMSWAP_TOOLS = [
     },
     required: ['peer'],
   }),
-  tool('intercomswap_ln_fundchannel', 'Open a Lightning channel to a peer.', {
+  tool('intercomswap_ln_fundchannel', 'Open a public Lightning channel to a peer.', {
     type: 'object',
     additionalProperties: false,
     properties: {
@@ -911,7 +911,6 @@ export const INTERCOMSWAP_TOOLS = [
         description: 'Optional nodeid@host:port. If node_id is omitted, the nodeid part is used.',
       },
       amount_sats: { type: 'integer', minimum: 1_000, maximum: 10_000_000_000 },
-      private: { type: 'boolean', description: 'Prefer private channels for swaps.' },
       sat_per_vbyte: { type: 'integer', minimum: 1, maximum: 10_000, description: 'Optional fee rate for the on-chain funding transaction.' },
     },
     required: ['amount_sats'],
