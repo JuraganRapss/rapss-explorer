@@ -1921,14 +1921,17 @@ export class ToolExecutor {
       return this._autopost.status({ name: name || '' });
     }
     if (toolName === 'intercomswap_autopost_start') {
-      assertAllowedKeys(args, toolName, ['name', 'tool', 'interval_sec', 'ttl_sec', 'valid_until_unix', 'args']);
+      // Apply prompt-mode repairs even when this tool is called directly (without /v1/run).
+      // Common issue: models use "arguments" instead of "args" for the nested sub-tool args.
+      const repairedArgs = repairToolArguments(toolName, args);
+      assertAllowedKeys(repairedArgs, toolName, ['name', 'tool', 'interval_sec', 'ttl_sec', 'valid_until_unix', 'args']);
       requireApproval(toolName, autoApprove);
-      const name = expectString(args, toolName, 'name', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
-      const tool = expectString(args, toolName, 'tool', { min: 1, max: 128 });
-      const intervalSec = expectInt(args, toolName, 'interval_sec', { min: 5, max: 24 * 3600 });
-      const ttlSec = expectInt(args, toolName, 'ttl_sec', { min: 10, max: 7 * 24 * 3600 });
-      const validUntil = expectOptionalInt(args, toolName, 'valid_until_unix', { min: 1 });
-      const subArgsRaw = args.args;
+      const name = expectString(repairedArgs, toolName, 'name', { min: 1, max: 64, pattern: /^[A-Za-z0-9._-]+$/ });
+      const tool = expectString(repairedArgs, toolName, 'tool', { min: 1, max: 128 });
+      const intervalSec = expectInt(repairedArgs, toolName, 'interval_sec', { min: 5, max: 24 * 3600 });
+      const ttlSec = expectInt(repairedArgs, toolName, 'ttl_sec', { min: 10, max: 7 * 24 * 3600 });
+      const validUntil = expectOptionalInt(repairedArgs, toolName, 'valid_until_unix', { min: 1 });
+      const subArgsRaw = repairedArgs.args;
       if (!isObject(subArgsRaw)) throw new Error(`${toolName}: args must be an object`);
       // Repair nested args for the scheduled sub-tool (common LLM mistake: flattening offer fields).
       const subArgs = repairToolArguments(tool, subArgsRaw);
